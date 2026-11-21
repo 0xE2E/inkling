@@ -64,7 +64,7 @@ $args_ = @(
     '--model', $Model, '--host', $BindHost, '--port', $Port,
     '--parallel', '1', '--flash-attn', 'on', '--no-context-shift',
     '-c', $Context, '--fit', 'on', '--fit-ctx', $Context, '--fit-target', '512',
-    '--ubatch-size', '2048', '--moe-cache-mib', 'auto', '--backend-sampling',
+    '--ubatch-size', '2048', '--moe-cache-mib', 'auto',
     '--load-mode', 'none', '--jinja', '--no-mmproj'
 )
 # passed through the environment: Windows PowerShell 5.1 strips the inner quotes of a JSON argument
