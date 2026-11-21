@@ -16,22 +16,30 @@ was no larger than the divergence the stock engine shows between two of its own 
 
 ## Results
 
-RTX 5080 Laptop, Windows 11, one user, greedy decoding. Five replayed coding-agent sessions (tool calls and reasoning
-included), cut at about 43k and 85k tokens, up to 300 generated tokens, GPU cooled to near idle before each run.
+RTX 5080 Laptop, Windows 11, one user, greedy decoding, same model file (UD-Q4_K_XL) and the same DSpark drafter
+(`dspark-Inkling-2-Mini-Q8_0.gguf`, 3 draft tokens for stock) in every row, 128k context window.
 
-| Configuration | Prefill (tok/s) | Decode at ~43k | Decode at ~85k |
-|---|---|---|---|
-| Unsloth llama.cpp, UD-Q8_K_XL, Unsloth Studio-style flags, DSpark 3 (90k window) | 300-520 | 17-25 | 17-25 |
-| Unsloth llama.cpp, UD-Q8_K_XL, f16 KV, DSpark 3 (90k window) | 790-870 with tuned flags | 23-33 | 23-33 |
-| **inkling, UD-Q4_K_XL, default profile (128k window)** | **2,331** cold 43k prompt, 1,898 on the 43k->85k increment | **88.7** (74-97) | **81.4** (61-104) |
+Same replayed coding-agent session for all three rows, cut at 43k and 81k tokens:
 
-The stock rows are two sessions each; the inkling row is the mean of five sessions, range in brackets. Decode speed at long
-context follows how much of the drafter's guess the model accepts (39-100% across these sessions), not the context length:
-a verify round takes about 37 ms at 43k and 42 ms at 85k.
+| Configuration | Prefill 43k cold | Prefill 43k->81k | Decode at 43k | Decode at 81k |
+|---|---|---|---|---|
+| Unsloth llama.cpp b12588, Unsloth Studio-style flags (q8_0 KV cache, `--fit-target 2092`) | 445 | 313 | 21.1 | 14.3 |
+| Unsloth llama.cpp b12588, tuned flags (`--ubatch-size 2048 --fit-target 512 --moe-cache-mib auto`) | 827 | 759 | 26.9 | 19.0 |
+| **inkling, default profile** | **2,292** | **1,899** | **97.4** | **73.1** |
+
+Against the best stock setup that is **2.8x / 2.5x prefill and 3.6x / 3.8x decode**; against the Studio-style setup
+5.2x / 6.1x prefill and 4.6x / 5.1x decode.
+
+Across five replayed sessions (tool calls and reasoning included, up to 300 generated tokens) inkling averages **2,331**
+tok/s prefill on a cold 43k prompt, **88.7** tok/s decode at ~43k (range 74-97) and **81.4** at ~85k (range 61-104).
+Decode speed at long context follows how much of the drafter's guess the model accepts (39-100% across these sessions),
+not the context length: a verify round takes about 37 ms at 43k and 42 ms at 85k.
 
 Read these with care:
 
 - One model, one quantization, one machine. Nothing here is a general benchmark.
+- The stock rows are single runs of one session; stock ran with the GPU warmer (about 60 C at start, lower clocks) than
+  the inkling rows, so they may understate stock somewhat.
 - The quant was chosen by measurement: with the same engine work at the time, Q4_K_XL decoded at 61 tok/s against 37 for
   the 21.3 GiB Q8_K_XL, which does not fit 16 GB and misses its expert cache far more often. Model-card quality of Q4_K_XL
   against Q8: KLD 0.0107, 98% same top token.
