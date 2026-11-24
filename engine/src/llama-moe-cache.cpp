@@ -598,11 +598,12 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-// AMB_MOE_LOOP_DEDUP=1 (C2 loop dedup, default off): looped models (hparams.loop_n_pass > 1, e.g. inkling2) visit the
-// physical blocks [loop_core_start, loop_core_end) several times; llama_model_loop_views gives each later visit its own
-// tensor views of the SAME host expert data. With the switch on, the cache treats every visit of a physical block as that
-// block: all per-layer state that describes expert identity is indexed by the representative layer rep(il) =
-// loop_visit(loop_layer(il)) (the first visit, an effective layer index, so the arrays keep their [n_layer] size):
+// AMB_MOE_LOOP_DEDUP=1 (C2 loop dedup, default off): looped models (b12649 inkling2_loop: model.layer_weights(il) != il)
+// visit the physical core layers several times, as extra cache slots after the physical layers;
+// llama_model_shared_host_views gives each later visit its own tensor views of the SAME host expert data. With the
+// switch on, the cache treats every visit of a physical block as that block: all per-layer state that describes expert
+// identity is indexed by the representative layer rep(il) = model.layer_weights(il) (the slot of the first visit, so the
+// arrays keep their [n_layer] size; see llama_moe_cache_loop_rep for the b12649 rule used with the switch off):
 //   - LRU keys make_key(rep, e), crf/last_use, is_selected and the victim protection of plan(rep)
 //   - the host slot map: lru.slot_map[il] of every visit points at the array of rep (one physical mapping, so every visit
 //     sees the same expert->slot map after every plan(); copy() uploads lru.slot_map[il], i.e. that shared array)
@@ -637,15 +638,64 @@ static bool llama_moe_cache_loop_dedup_env(const char ** why) {
     return *why == nullptr;
 }
 
-// the representative layer of each effective layer (identity if dedup is off or the model is not looped)
-static std::vector<int32_t> llama_moe_cache_loop_rep(const llama_model & model, bool dedup) {
+// the weight whose data t reads: t itself, or the weight it views whole (a later visit of a looped layer can hold such a view)
+static const ggml_tensor * llama_moe_cache_weight_of(const ggml_tensor * t) {
+    while (t->view_src != nullptr && t->view_offs == 0 && t->view_src->type == t->type &&
+            ggml_are_same_shape(t, t->view_src) && ggml_are_same_stride(t, t->view_src)) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// the representative layer of each effective layer (identity if no layer shares the experts of another one)
+// pair AMB_MOE_LOOP_DEDUP <-> b12649 MoE cache dedupe (LLAMA_MOE_CACHE_DEDUPE, default on): both give the layers that
+// read the same expert weights one cache entry. One implementation (the representative layer rep(il) described above,
+// which the prefetch / lookahead / elastic / stats code is written against), two rules for rep:
+//   - AMB_MOE_LOOP_DEDUP=1 (accepted): rep(il) = model.layer_weights(il), the physical layer of a looped cache slot
+//   - otherwise, LLAMA_MOE_CACHE_DEDUPE != 0 (the b12649 default): rep(il) = the first earlier layer whose expert tensors
+//     read the same weights (llama_moe_cache_weight_of), the b12649 owner rule
+//   - LLAMA_MOE_CACHE_DEDUPE=0, or a mode that refuses AMB_MOE_LOOP_DEDUP is on: no sharing (identity)
+// The constructor keeps rep(il) only if rep(il) is cached in the same group with the same host data.
+// ours: the AMB_MOE_LOOP_DEDUP rule was taken; why_off: set when a mode with per-layer state refuses any sharing
+static std::vector<int32_t> llama_moe_cache_loop_rep(const llama_model & model, bool * ours, const char ** why_off) {
+    const char * why = nullptr;
+    *ours = llama_moe_cache_loop_dedup_env(&why);
+    if (why == nullptr && !*ours) {
+        // the b12649 rule needs the same guarantees as ours: refused by the same modes
+        if (const char * s = getenv("AMB_MOE_PREFETCH"); s != nullptr && (atoi(s) == 1 || atoi(s) == 4)) {
+            why = "AMB_MOE_PREFETCH is on (second-stream prefetch keyed on the effective layer)";
+        } else if (const char * s = getenv("AMB_MOE_LOOKAHEAD"); s != nullptr && *s != '\0' && strcmp(s, "0") != 0) {
+            why = "AMB_MOE_LOOKAHEAD is on (lookahead victims and first-victim rule keyed on the effective layer)";
+        } else if (const char * s = getenv("AMB_MOE_MISS_OVERLAP"); s != nullptr && (strcmp(s, "1") == 0 || strcmp(s, "2") == 0)) {
+            why = "AMB_MOE_MISS_OVERLAP is on (miss uploads on the upload stream, per-layer publish/gate state)";
+        }
+    }
+    *why_off = why;
+    const char * dedupe_env = getenv("LLAMA_MOE_CACHE_DEDUPE");
+    const bool unsloth = !*ours && why == nullptr && (dedupe_env == nullptr || strcmp(dedupe_env, "0") != 0);
+
     std::vector<int32_t> res(model.layers.size());
     for (size_t il = 0; il < res.size(); ++il) {
         res[il] = (int32_t) il;
-        if (dedup && model.hparams.loop_n_pass > 1) {
-            const int32_t rep = (int32_t) model.hparams.loop_visit(model.hparams.loop_layer((uint32_t) il));
+        if (*ours) {
+            const int32_t rep = model.layer_weights((int32_t) il);
             if (rep >= 0 && rep <= (int32_t) il) {
                 res[il] = rep;
+            }
+        } else if (unsloth) {
+            const auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+            for (size_t j = 0; j < il && !experts.empty() && res[il] == (int32_t) il; ++j) {
+                if (res[j] != (int32_t) j) {
+                    continue;
+                }
+                const auto ref = llama_moe_cache_layer_experts(model.layers[j]);
+                bool same = ref.size() == experts.size();
+                for (size_t ip = 0; ip < experts.size() && same; ++ip) {
+                    same = llama_moe_cache_weight_of(experts[ip]) == llama_moe_cache_weight_of(ref[ip]);
+                }
+                if (same) {
+                    res[il] = (int32_t) j;
+                }
             }
         }
     }
@@ -659,7 +709,7 @@ struct llama_moe_cache::impl {
     struct device {
         ggml_backend_t backend;
         ggml_backend_buffer_type_t buft;
-        size_t host_bytes = 0; // host experts of the layers it caches
+        size_t host_bytes = 0; // host experts of the layers it caches, the experts shared by several layers counted once
         double split = 0.0;    // share of the budget
 
         // banks and their views
@@ -847,7 +897,8 @@ struct llama_moe_cache::impl {
     // AMB_MOE_LOOP_DEDUP (see llama_moe_cache_loop_dedup_env): rep[il] the representative layer of il, il itself with the
     // switch off (then every use below is the old code path); AMB_MOE_LOOP_DEDUP_CHECK=1: verify the physical mapping
     // after every plan()
-    bool loop_dedup = false;
+    bool loop_dedup = false;      // some layer shares the slots of its representative (either rule)
+    bool loop_dedup_ours = false; // ... by the AMB_MOE_LOOP_DEDUP rule (else by the b12649 rule)
     bool loop_dedup_check = false;
     std::vector<int32_t> rep;
     uint64_t loop_dedup_checks = 0;
@@ -1480,12 +1531,16 @@ struct llama_moe_cache::impl {
         // AMB_MOE_LOOP_DEDUP: decided from the environment and the model only, so the --fit pass sizes the same split
         {
             const char * why = nullptr;
-            loop_dedup = llama_moe_cache_loop_dedup_env(&why);
+            bool ours = false;
+            rep = llama_moe_cache_loop_rep(model, &ours, &why);
             if (why != nullptr) {
-                LLAMA_LOG_WARN("%s: amb_loop_dedup: refused, off: %s\n", __func__, why);
+                LLAMA_LOG_WARN("%s: amb_loop_dedup: refused, off (also the b12649 MoE cache dedupe): %s\n", __func__, why);
             }
-            loop_dedup = loop_dedup && model.hparams.loop_n_pass > 1;
-            rep = llama_moe_cache_loop_rep(model, loop_dedup);
+            loop_dedup = false;
+            for (size_t il = 0; il < rep.size(); ++il) {
+                loop_dedup = loop_dedup || rep[il] != (int32_t) il;
+            }
+            loop_dedup_ours = loop_dedup && ours;
             loop_dedup_check = loop_dedup && [] {
                 const char * v = getenv("AMB_MOE_LOOP_DEDUP_CHECK");
                 return v != nullptr && strcmp(v, "1") == 0;
@@ -1879,7 +1934,8 @@ struct llama_moe_cache::impl {
             for (const device & d : devices) {
                 host += d.host_bytes;
             }
-            LLAMA_LOG_INFO("amb_loop_dedup: on, %d effective layers -> %d physical, host experts %.2f MiB%s\n",
+            LLAMA_LOG_INFO("amb_loop_dedup: on (%s), %d effective layers -> %d physical, host experts %.2f MiB%s\n",
+                loop_dedup_ours ? "AMB_MOE_LOOP_DEDUP" : "b12649 rule, LLAMA_MOE_CACHE_DEDUPE=0 to disable",
                 n_eff, n_phys, host/1024.0/1024.0, loop_dedup_check ? " (AMB_MOE_LOOP_DEDUP_CHECK=1)" : "");
         }
 
@@ -3724,15 +3780,17 @@ struct llama_moe_cache::impl {
         return devices[groups[layers[il].ig].id].backend;
     }
 
-    // trace format, little endian: "MCT1", then u32 n_layer, n_expert_used, n_group
-    // per group: u32 device, n_expert, n_layers, the layers (u32), f64 split, split_sum, u64 group host bytes, device host bytes, alignment,
+    // trace format, little endian: "MCT1", or "MCT2" if some layers share the experts of another layer, then u32 n_layer, n_expert_used, n_group
+    // per group: u32 device, n_expert, n_layers, the layers (u32; MCT2: u32 layer and u32 owner, the layer whose slots it shares),
+    //            f64 split, split_sum, u64 group host bytes, device host bytes, alignment,
     //            u32 n_tensors, the bytes of one expert of each tensor (u64)
     // then one record per slot lookup: i32 layer, experts per token, n_ids, the ids (i32)
     void write_trace_header(double split_sum) {
         auto u32 = [&](uint32_t v) { fwrite(&v, sizeof(v), 1, trace); };
         auto u64 = [&](uint64_t v) { fwrite(&v, sizeof(v), 1, trace); };
         auto f64 = [&](double   v) { fwrite(&v, sizeof(v), 1, trace); };
-        fwrite("MCT1", 1, 4, trace);
+        const bool shared = loop_dedup;
+        fwrite(shared ? "MCT2" : "MCT1", 1, 4, trace);
         u32(layers.size());
         u32(n_expert_used);
         u32(groups.size());
@@ -3743,6 +3801,9 @@ struct llama_moe_cache::impl {
             u32(g.layers.size());
             for (int32_t il : g.layers) {
                 u32(il);
+                if (shared) {
+                    u32(rep[il]);
+                }
             }
             f64(d.split);
             f64(split_sum);
@@ -6177,12 +6238,14 @@ static size_t llama_moe_cache_min_size_dev(const llama_model & model, ggml_backe
     const size_t  alignment     = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(dev));
 
     // same grouping as the constructor, the budget is split by the size of the experts
+    // the layers that read the same expert weights (looped layers, a whole view of a weight is the weight) count them once,
+    // by the rule of the constructor (AMB_MOE_LOOP_DEDUP, else the b12649 LLAMA_MOE_CACHE_DEDUPE rule; no log here)
     std::vector<std::vector<ggml_tensor *>> refs;
     std::vector<size_t> group_bytes;
     size_t host_bytes = 0;
-    // AMB_MOE_LOOP_DEDUP: each physical expert tensor counted once, as in the constructor (no log here)
     const char * why = nullptr;
-    const std::vector<int32_t> rep = llama_moe_cache_loop_rep(model, llama_moe_cache_loop_dedup_env(&why) && model.hparams.loop_n_pass > 1);
+    bool ours = false;
+    const std::vector<int32_t> rep = llama_moe_cache_loop_rep(model, &ours, &why);
     for (size_t il = 0; il < model.layers.size(); ++il) {
         auto experts = llama_moe_cache_layer_experts(model.layers[il]);
         if (experts.empty() || model.dev_layer(il) != dev ||

@@ -28,10 +28,12 @@ stock engine shows between two of its own kernel choices (about 0.0027-0.0028 on
 | `AMB_PF_OVERLAP=1`, `AMB_PF_OVERLAP_SLOTS=3` | prefill uploads whole expert tensors ahead of the layer on a second stream, into ring slots borrowed from the cache | exact |
 | `AMB_INK_PF_BIAS=1`, `AMB_INK_PF_CTRL=1` | prefill: the dense sliding-window bias chain and the loop controllers as single kernels | exact |
 | `AMB_INK_PF_MIX=1` | prefill: fused depth mix (the stock path fed a 2,048-token batch to a matrix-vector kernel) | KLD |
-| `AMB_DSPARK_TRIM=1` | the drafter's recurrent chain stops at the draft length | exact |
+| `AMB_DSPARK_TRIM=1` | the drafter runs the target output head once per draft block instead of once per drafted position, and its recurrent chain stops at the draft length | exact |
 | `AMB_DSPARK_IDS=1` | draft token ids come from the graph instead of logits plus host sampling | exact |
 | `AMB_DSPARK_HEAD_WH=1` | the drafter's chain reads a precomputed 99 MiB product instead of the 492 MB output head per step | drafts identical |
 | `AMB_DSPARK_ADAPT=1` | draft length 3, raised to `--spec-draft-n-max` (5) after 24 rounds at >= 85% acceptance, lowered again at <= 70% | exact (greedy verify) |
+| `AMB_H2D_ZC=1` | host-to-device copies on the compute stream (expert cache fills, slot maps, staging uploads) from pinned memory are done by a copy kernel that reads host memory directly. On Windows (WDDM) every DMA copy on a stream waits ~65 us before it runs, whatever its size; the kernel has no fixed cost and reaches ~45-49 GB/s. Prefill's upload ring and other private streams stay on DMA | exact (copy test, check mode, delayed-read and fault-injection controls) |
+| `AMB_FA_VERIFY=1` | flash attention for speculative verify rows (GQA-packed, 9-32 query rows, KV >= 4096): enables the kernel's 2-stage asynchronous K/V/mask load pipeline, which was off for this kernel shape (one load after another per KV tile). Global-layer attention per verify round -25% | exact on the gate sessions (tokens and drafts identical) |
 
 ## Present but off (measured and rejected, or unfinished)
 
@@ -43,9 +45,13 @@ stock engine shows between two of its own kernel choices (about 0.0027-0.0028 on
 | `AMB_INK_PF_SWA_REPACK=1` | re-pack the sliding-window ring before each prefill batch: works, +3% over `PF_BIAS`, costs ~0.8 GB of cache |
 | `AMB_MOE_LOOKAHEAD`, `AMB_MOE_MISS_OVERLAP` | ported from qwen-next; refused together with loop dedup |
 | `AMB_ELASTIC_FLOOR_MIB=N` | meant to let a 256k context fit with a lent cache floor; no effect yet (open item) |
+| `AMB_GRAPH_DIFF_LOG=1` | diagnostic: logs which CUDA graph and which node field changed when a graph is re-captured under a cached key |
 
 ## Debug and checks
 
 `AMB_INK_FUSE_CHECK=1` compares fused against unfused results per site. `AMB_MMVF_SMALL_CHECK=N`, `AMB_DSPARK_IDS=2`,
 `AMB_ELASTIC_CHECK=1`, `AMB_ELASTIC_POISON=1` (memory that changes owner is filled with markers; tokens must not change),
 `AMB_MOE_STATS=N` (cache statistics every N decode batches), `AMB_INK_NODES=1` (graph node counts).
+`AMB_H2D_ZC_CHECK=1` (each kernel copy compared with a DMA copy), `AMB_H2D_ZC_STATS=N`, `AMB_H2D_ZC_MAX=<bytes>` (larger
+copies stay on DMA), `AMB_H2D_ZC_DELAY_US=N` and `AMB_H2D_ZC_FAULT=1` (negative control: delayed reads must not change the output,
+corrupted sources must), and `tests/test-h2d-zc.cpp` (byte-exact copy test over sizes, alignments and batch counts).

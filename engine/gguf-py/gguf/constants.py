@@ -157,9 +157,6 @@ class Keys:
         FULL_ATTENTION_INTERVAL           = "{arch}.full_attention_interval"
         NUM_LOOPS                         = "{arch}.num_loops"
         SKIP_LOOP_FINAL_NORM              = "{arch}.skip_loop_final_norm"
-        LOOP_CORE_START                   = "{arch}.loop.core_start"
-        LOOP_CORE_END                     = "{arch}.loop.core_end"
-        LOOP_GATE_RANK                    = "{arch}.loop.gate_rank"
         HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
         ACTIVATION_SPARSITY_SCALE         = "{arch}.activation_sparsity_scale"
         ALTUP_ACTIVE_IDX                  = "{arch}.altup.active_idx"
@@ -178,9 +175,9 @@ class Keys:
         CONV_GROUP_SIZE                   = "{arch}.conv_group_size"
         SELECTOR_RANK                     = "{arch}.selector_rank"
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
-        DSPARK_MARKOV_RANK                = "{arch}.dspark.markov_rank"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
+        HAS_MARKOV_CONTEXT                = "{arch}.has_markov_context"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
         REALTIME_DELAY_TOKENS             = "{arch}.realtime_delay_tokens"
@@ -329,6 +326,13 @@ class Keys:
         H_CYCLES         = "{arch}.hrm.h_cycles"
         L_CYCLES         = "{arch}.hrm.l_cycles"
         PREFIX_LM        = "{arch}.hrm.prefix_lm"
+
+    class Loop:
+        START     = "{arch}.loop.start"
+        END       = "{arch}.loop.end"
+        COUNT     = "{arch}.loop.count"
+        GATE_RANK = "{arch}.loop.gate_rank"
+        VARYING   = "{arch}.loop.varying"
 
     class Metis:
         PASS_COUNT               = "{arch}.metis.pass_count"
@@ -784,6 +788,7 @@ class MODEL_ARCH(IntEnum):
     INKLING          = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
+    MOSHI            = auto()
     ZONOS3           = auto()
     KOKORO           = auto()
     TINY_VOCA        = auto()
@@ -791,6 +796,7 @@ class MODEL_ARCH(IntEnum):
     KOLIBRI1         = auto()
     LIMITE           = auto()
     INKLING2         = auto()
+    INKLING2_LOOP    = auto()
     DOMYN_EDGE       = auto()
 
 
@@ -823,8 +829,6 @@ class MODEL_TENSOR(IntEnum):
     DENSE_3_OUT          = auto() # embeddinggemma 3_Dense
     OUTPUT_NORM          = auto()
     OUTPUT_RES_QUERY     = auto()
-    LOOP_RES_QUERY       = auto() # inkling2 loop
-    LOOP_KV_RES_QUERY    = auto() # inkling2 loop
     HC_HEAD_FN           = auto()
     HC_HEAD_BASE         = auto()
     HC_HEAD_SCALE        = auto()
@@ -863,9 +867,6 @@ class MODEL_TENSOR(IntEnum):
     ATTN_V_CONV_PROJ     = auto()
     ATTN_POST_CONV       = auto()
     ATTN_RES_QUERY       = auto()
-    ATTN_K_CTX           = auto()
-    ATTN_V_CTX           = auto()
-    ATTN_K_CTX_NORM      = auto()
     FFN_GATE_INP         = auto()
     FFN_GATE_INP_SHEXP   = auto()
     FFN_NORM             = auto()
@@ -898,18 +899,19 @@ class MODEL_TENSOR(IntEnum):
     MOE_LATENT_UP        = auto() # nemotron 3 super
     FFN_POST_CONV        = auto()
     FFN_RES_QUERY        = auto()
-    LOOP_ATTN_DOWN       = auto() # inkling2 loop
-    LOOP_ATTN_GAIN       = auto()
-    LOOP_ATTN_FORGET     = auto()
-    LOOP_K_DOWN          = auto()
-    LOOP_K_GAIN          = auto()
-    LOOP_K_FORGET        = auto()
-    LOOP_V_DOWN          = auto()
-    LOOP_V_GAIN          = auto()
-    LOOP_V_FORGET        = auto()
-    LOOP_MLP_DOWN        = auto()
-    LOOP_MLP_GAIN        = auto()
-    LOOP_MLP_FORGET      = auto()
+    LOOP_MSG_QUERY       = auto()
+    LOOP_Q_CTRL_DOWN     = auto()
+    LOOP_Q_CTRL_GAIN     = auto()
+    LOOP_Q_CTRL_FORGET   = auto()
+    LOOP_K_CTRL_DOWN     = auto()
+    LOOP_K_CTRL_GAIN     = auto()
+    LOOP_K_CTRL_FORGET   = auto()
+    LOOP_V_CTRL_DOWN     = auto()
+    LOOP_V_CTRL_GAIN     = auto()
+    LOOP_V_CTRL_FORGET   = auto()
+    LOOP_FFN_CTRL_DOWN   = auto()
+    LOOP_FFN_CTRL_GAIN   = auto()
+    LOOP_FFN_CTRL_FORGET = auto()
     STREAM_EMBD          = auto()
     DEPTH_MEM_STATE_WRITE = auto()
     DEPTH_MEM_META_WRITE = auto()
@@ -1557,10 +1559,8 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_CONF_PROJ       = auto()  # confidence head
     DSPARK_JOINT_PROJ      = auto()  # rnn markov head
     DSPARK_MASK_EMBD       = auto()  # per-slot mask embeddings
-    DSPARK_FUSE            = auto()
-    DSPARK_NORM            = auto()
-    DSPARK_HIDDEN_OUT      = auto()
-    DFLARE_NORM            = auto()
+    DSPARK_MARKOV_CTX_MIX  = auto()  # rnn markov head: target feature mix
+    DSPARK_MARKOV_CTX_NORM = auto()  # rnn markov head: target feature norm
     ENGRAM_KV              = auto()
     ENGRAM_GATE            = auto()
     DFLASH_ATTN_CONV_BASE  = auto()
@@ -1570,6 +1570,11 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DFLASH_CTX_MIX         = auto()  # per-layer target feature mix
+    DFLASH_CTX_NORM        = auto()  # per-layer target feature norm
+    DFLASH_ATTN_K_CTX      = auto()  # per-layer context K projection
+    DFLASH_ATTN_V_CTX      = auto()  # per-layer context V projection
+    DFLASH_ATTN_K_CTX_NORM = auto()
     LILICORR_TOKEN_PROJ           = auto()
     LILICORR_PASS_HIDDEN_PROJ     = auto()
     LILICORR_SLOT_EMBD            = auto()
@@ -1821,6 +1826,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.INKLING:          "inkling",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
+    MODEL_ARCH.MOSHI:            "moshi",
     MODEL_ARCH.ZONOS3:           "zonos3",
     MODEL_ARCH.KOKORO:           "kokoro",
     MODEL_ARCH.TINY_VOCA:        "tiny-voca",
@@ -1828,6 +1834,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.KOLIBRI1:         "kolibri1",
     MODEL_ARCH.LIMITE:           "limite",
     MODEL_ARCH.INKLING2:         "inkling2",
+    MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
     MODEL_ARCH.DOMYN_EDGE:       "domynedge",
 }
 
@@ -1855,8 +1862,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
     MODEL_TENSOR.OUTPUT:                    "output",
     MODEL_TENSOR.OUTPUT_RES_QUERY:          "output_res_query",
-    MODEL_TENSOR.LOOP_RES_QUERY:            "loop_res_query",
-    MODEL_TENSOR.LOOP_KV_RES_QUERY:         "loop_kv_res_query",
     MODEL_TENSOR.HRM_Z_L_INIT:              "hrm.z_l_init",
     MODEL_TENSOR.DENSE_2_OUT:               "dense_2", # embeddinggemma 2_Dense
     MODEL_TENSOR.DENSE_3_OUT:               "dense_3", # embeddinggemma 2_Dense
@@ -1896,9 +1901,6 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_V_CONV_PROJ:          "blk.{bid}.attn_v_conv_proj",
     MODEL_TENSOR.ATTN_POST_CONV:            "blk.{bid}.attn_post_conv",
     MODEL_TENSOR.ATTN_RES_QUERY:            "blk.{bid}.attn_res_query",
-    MODEL_TENSOR.ATTN_K_CTX:                "blk.{bid}.attn_k_ctx",
-    MODEL_TENSOR.ATTN_V_CTX:                "blk.{bid}.attn_v_ctx",
-    MODEL_TENSOR.ATTN_K_CTX_NORM:           "blk.{bid}.attn_k_ctx_norm",
     MODEL_TENSOR.ATTN_Q_NORM:               "blk.{bid}.attn_q_norm",
     MODEL_TENSOR.ATTN_K_NORM:               "blk.{bid}.attn_k_norm",
     MODEL_TENSOR.ATTN_OUT_NORM:             "blk.{bid}.attn_output_norm",
@@ -1935,18 +1937,19 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
     MODEL_TENSOR.FFN_POST_CONV:             "blk.{bid}.ffn_post_conv",
     MODEL_TENSOR.FFN_RES_QUERY:             "blk.{bid}.ffn_res_query",
-    MODEL_TENSOR.LOOP_ATTN_DOWN:            "blk.{bid}.loop_attn_down",
-    MODEL_TENSOR.LOOP_ATTN_GAIN:            "blk.{bid}.loop_attn_gain",
-    MODEL_TENSOR.LOOP_ATTN_FORGET:          "blk.{bid}.loop_attn_forget",
-    MODEL_TENSOR.LOOP_K_DOWN:               "blk.{bid}.loop_k_down",
-    MODEL_TENSOR.LOOP_K_GAIN:               "blk.{bid}.loop_k_gain",
-    MODEL_TENSOR.LOOP_K_FORGET:             "blk.{bid}.loop_k_forget",
-    MODEL_TENSOR.LOOP_V_DOWN:               "blk.{bid}.loop_v_down",
-    MODEL_TENSOR.LOOP_V_GAIN:               "blk.{bid}.loop_v_gain",
-    MODEL_TENSOR.LOOP_V_FORGET:             "blk.{bid}.loop_v_forget",
-    MODEL_TENSOR.LOOP_MLP_DOWN:             "blk.{bid}.loop_mlp_down",
-    MODEL_TENSOR.LOOP_MLP_GAIN:             "blk.{bid}.loop_mlp_gain",
-    MODEL_TENSOR.LOOP_MLP_FORGET:           "blk.{bid}.loop_mlp_forget",
+    MODEL_TENSOR.LOOP_MSG_QUERY:            "blk.{bid}.loop_msg_query",
+    MODEL_TENSOR.LOOP_Q_CTRL_DOWN:          "blk.{bid}.loop_q_ctrl_down",
+    MODEL_TENSOR.LOOP_Q_CTRL_GAIN:          "blk.{bid}.loop_q_ctrl_gain",
+    MODEL_TENSOR.LOOP_Q_CTRL_FORGET:        "blk.{bid}.loop_q_ctrl_forget",
+    MODEL_TENSOR.LOOP_K_CTRL_DOWN:          "blk.{bid}.loop_k_ctrl_down",
+    MODEL_TENSOR.LOOP_K_CTRL_GAIN:          "blk.{bid}.loop_k_ctrl_gain",
+    MODEL_TENSOR.LOOP_K_CTRL_FORGET:        "blk.{bid}.loop_k_ctrl_forget",
+    MODEL_TENSOR.LOOP_V_CTRL_DOWN:          "blk.{bid}.loop_v_ctrl_down",
+    MODEL_TENSOR.LOOP_V_CTRL_GAIN:          "blk.{bid}.loop_v_ctrl_gain",
+    MODEL_TENSOR.LOOP_V_CTRL_FORGET:        "blk.{bid}.loop_v_ctrl_forget",
+    MODEL_TENSOR.LOOP_FFN_CTRL_DOWN:        "blk.{bid}.loop_ffn_ctrl_down",
+    MODEL_TENSOR.LOOP_FFN_CTRL_GAIN:        "blk.{bid}.loop_ffn_ctrl_gain",
+    MODEL_TENSOR.LOOP_FFN_CTRL_FORGET:      "blk.{bid}.loop_ffn_ctrl_forget",
     MODEL_TENSOR.STREAM_EMBD:               "stream_embd",
     MODEL_TENSOR.DEPTH_MEM_STATE_WRITE:     "depth_mem_state_write",
     MODEL_TENSOR.DEPTH_MEM_META_WRITE:      "depth_mem_meta_write",
@@ -2631,10 +2634,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
     MODEL_TENSOR.DSPARK_JOINT_PROJ:         "joint_proj",
     MODEL_TENSOR.DSPARK_MASK_EMBD:          "mask_embd",
-    MODEL_TENSOR.DSPARK_FUSE:               "dspark_fuse",
-    MODEL_TENSOR.DSPARK_NORM:               "dspark_norm",
-    MODEL_TENSOR.DSPARK_HIDDEN_OUT:         "dspark_hidden_out",
-    MODEL_TENSOR.DFLARE_NORM:               "blk.{bid}.dflare_norm",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX:     "markov_ctx_mix",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM:    "markov_ctx_norm",
     MODEL_TENSOR.ENGRAM_KV:                 "blk.{bid}.engram_kv",
     MODEL_TENSOR.ENGRAM_GATE:               "blk.{bid}.engram_gate",
     MODEL_TENSOR.DFLASH_ATTN_CONV_BASE:     "blk.{bid}.attn_conv_base",
@@ -2644,6 +2645,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DFLASH_CTX_MIX:            "blk.{bid}.ctx_mix",
+    MODEL_TENSOR.DFLASH_CTX_NORM:           "blk.{bid}.ctx_norm",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX:         "blk.{bid}.attn_k_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_V_CTX:         "blk.{bid}.attn_v_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM:    "blk.{bid}.attn_k_ctx_norm",
     MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
     MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
     MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
@@ -6571,6 +6577,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.LAYER_OUT_SCALE,
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.ATTN_NORM,
@@ -6592,9 +6599,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_KV_A_NORM,
         MODEL_TENSOR.ATTN_K_B,
         MODEL_TENSOR.ATTN_V_B,
-        MODEL_TENSOR.ATTN_K_CTX,
-        MODEL_TENSOR.ATTN_V_CTX,
-        MODEL_TENSOR.ATTN_K_CTX_NORM,
         MODEL_TENSOR.HC_ATTN_FN,
         MODEL_TENSOR.HC_ATTN_BASE,
         MODEL_TENSOR.HC_ATTN_SCALE,
@@ -6625,10 +6629,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DSPARK_CONF_PROJ,
         MODEL_TENSOR.DSPARK_JOINT_PROJ,
         MODEL_TENSOR.DSPARK_MASK_EMBD,
-        MODEL_TENSOR.DSPARK_FUSE,
-        MODEL_TENSOR.DSPARK_NORM,
-        MODEL_TENSOR.DSPARK_HIDDEN_OUT,
-        MODEL_TENSOR.DFLARE_NORM,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM,
         MODEL_TENSOR.DFLASH_ATTN_CONV_BASE,
         MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ,
         MODEL_TENSOR.DFLASH_FFN_CONV_BASE,
@@ -6636,6 +6638,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DFLASH_CTX_MIX,
+        MODEL_TENSOR.DFLASH_CTX_NORM,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_V_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM,
         MODEL_TENSOR.LILICORR_TOKEN_PROJ,
         MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
         MODEL_TENSOR.LILICORR_SLOT_EMBD,
@@ -7076,6 +7083,20 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
     ],
+    MODEL_ARCH.MOSHI: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ],
     MODEL_ARCH.TINY_VOCA: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -7240,20 +7261,55 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_POST_CONV,
         MODEL_TENSOR.FFN_RES_QUERY,
-        MODEL_TENSOR.LOOP_RES_QUERY,
-        MODEL_TENSOR.LOOP_KV_RES_QUERY,
-        MODEL_TENSOR.LOOP_ATTN_DOWN,
-        MODEL_TENSOR.LOOP_ATTN_GAIN,
-        MODEL_TENSOR.LOOP_ATTN_FORGET,
-        MODEL_TENSOR.LOOP_K_DOWN,
-        MODEL_TENSOR.LOOP_K_GAIN,
-        MODEL_TENSOR.LOOP_K_FORGET,
-        MODEL_TENSOR.LOOP_V_DOWN,
-        MODEL_TENSOR.LOOP_V_GAIN,
-        MODEL_TENSOR.LOOP_V_FORGET,
-        MODEL_TENSOR.LOOP_MLP_DOWN,
-        MODEL_TENSOR.LOOP_MLP_GAIN,
-        MODEL_TENSOR.LOOP_MLP_FORGET,
+    ],
+    MODEL_ARCH.INKLING2_LOOP: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT_RES_QUERY,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_REL,
+        MODEL_TENSOR.ATTN_REL_BIAS,
+        MODEL_TENSOR.ATTN_Q_CLIP,
+        MODEL_TENSOR.ATTN_REL_CLIP,
+        MODEL_TENSOR.ATTN_SINK_PROJ,
+        MODEL_TENSOR.ATTN_Q_INP_NORM,
+        MODEL_TENSOR.ATTN_K_INP_NORM,
+        MODEL_TENSOR.ATTN_V_INP_NORM,
+        MODEL_TENSOR.ATTN_K_CONV,
+        MODEL_TENSOR.ATTN_V_CONV,
+        MODEL_TENSOR.ATTN_K_CONV_PROJ,
+        MODEL_TENSOR.ATTN_V_CONV_PROJ,
+        MODEL_TENSOR.ATTN_POST_CONV,
+        MODEL_TENSOR.ATTN_RES_QUERY,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_POST_CONV,
+        MODEL_TENSOR.FFN_RES_QUERY,
+        MODEL_TENSOR.LOOP_MSG_QUERY,
+        MODEL_TENSOR.LOOP_Q_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_Q_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_Q_CTRL_FORGET,
+        MODEL_TENSOR.LOOP_K_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_K_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_K_CTRL_FORGET,
+        MODEL_TENSOR.LOOP_V_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_V_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_V_CTRL_FORGET,
+        MODEL_TENSOR.LOOP_FFN_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_FFN_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_FFN_CTRL_FORGET,
     ],
     MODEL_ARCH.DOMYN_EDGE: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -7609,6 +7665,8 @@ class VisionProjectorType:
     QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
     POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder
     POCKETTTS_GEN = "pockettts_gen" # audio generation: flow-matching decoder + mimi decoder
+    MOSHI = "moshi" # audio: streaming mimi encoder, input audio codes -> backbone rows
+    MOSHI_GEN = "moshi_gen" # audio generation: depformer + mimi decoder
     CHATTERBOX_SPKENC = "chatterbox_spkenc" # audio: CAMPPlus speaker encoder
     CHATTERBOX = "chatterbox" # audio generation: s3gen flow matching + HiFT vocoder
     SOPRANO = "soprano" # audio generation: Vocos decoder

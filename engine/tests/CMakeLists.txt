@@ -367,6 +367,11 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+if (GGML_CUDA AND NOT GGML_BACKEND_DL)
+    # AMB_H2D_ZC zero-copy H2D path of the CUDA backend; needs a CUDA device, so it is built but not registered with ctest
+    llama_build(test-h2d-zc.cpp LINK ggml ggml-cuda)
+endif()
+
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)
 llama_build_and_test(test-backend-sched.cpp LINK ggml)

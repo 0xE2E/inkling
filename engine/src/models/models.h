@@ -770,6 +770,18 @@ struct llama_model_pockettts : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_moshi : public llama_model_base {
+    llama_model_moshi(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_kokoro : public llama_model_base {
     llama_model_kokoro(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1653,7 +1665,6 @@ struct llama_model_dflash : public llama_model_base {
         BACKBONE_DSV4,
         BACKBONE_DSV41,
         BACKBONE_MISTRAL_LARGE4,
-        BACKBONE_INKLING2,
     };
 
     variant_type  variant  = VARIANT_DFLASH;
@@ -1662,15 +1673,18 @@ struct llama_model_dflash : public llama_model_base {
     void load_hparams_lilicorr(llama_model_loader & ml);
     void load_hparams_dsv4(llama_model_loader & ml);
     void load_hparams_mistral_large4(llama_model_loader & ml);
-    void load_hparams_inkling2(llama_model_loader & ml);
     void load_tensors_dflash2();
     void load_tensors_dflash2_conv();
     void load_tensors_dspark(int64_t n_vocab_draft);
+    void load_tensors_inkling2_head();
+
+    struct graph_inkling2_head : public llm_graph_context {
+        graph_inkling2_head(const llm_graph_params & params);
+    };
     void load_tensors_lilicorr();
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
     void load_tensors_layers_mistral_large4();
-    void load_tensors_inkling2();
 
     template <bool is_enc>
     struct graph : public llm_graph_context {
@@ -1693,8 +1707,13 @@ struct llama_model_dflash : public llama_model_base {
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();
+        void          build_inject_ctx_mix();
+        void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
+        ggml_tensor * build_inp_block(ggml_tensor * inp_tokens);
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
+        ggml_tensor * build_inkling2_embd(ggml_tensor * inp_tokens);
+        ggml_tensor * mix_target_features(ggml_tensor * features, int row, ggml_tensor * norm);
         ggml_tensor * build_logits(ggml_tensor * cur);
         ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il);
     };
@@ -1709,6 +1728,7 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dspark : public graph_base {
         graph_dspark(const llm_graph_params & params);
+        void build_inkling2_block(ggml_tensor * tokens, ggml_tensor * hidden);
     };
 
     struct graph_lilicorr : public graph_base {
@@ -1729,13 +1749,7 @@ struct llama_model_dflash : public llama_model_base {
         graph_mistral_large4(const llm_graph_params & params);
     };
 
-    // Inkling2 DSpark: block backbone decoded once, then one recurrent markov head step per drafted token
-    struct graph_inkling2 : public llm_graph_context {
-        graph_inkling2(const llm_graph_params & params);
-    };
-
     // graph helpers shared by the backbones
-    static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp);
     static ggml_tensor * build_inject_inp(llm_graph_context & g, const llama_model & model);
     static ggml_tensor * get_tok_embd(const llm_graph_context & g, const llama_model & model);
     static std::pair<ggml_tensor *, ggml_tensor *> get_lm_head(const llm_graph_context & g, const llama_model & model);
@@ -2560,14 +2574,27 @@ struct llama_model_inkling2 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
+    // the layers stored in the file
+    virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
+    enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
+
+    struct loop_layer {
+        ggml_tensor * msg_query = nullptr;
+        ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
+    };
+
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
+        // il: the layer whose device runs the mix (the shared stacks are kept per device), -1 if unknown
         // tq (C3c, fused mix only): the result is [n_embd, n_tokens, n_query], see mix_query()
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, bool tq = false);
+        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il = -1, bool tq = false);
         // row j of a mix result as [n_embd, n_tokens], for either layout
         ggml_tensor * mix_query(ggml_tensor * mixed, int64_t j);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,
@@ -2577,6 +2604,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 llm_graph_input_rs * inp,
                 int64_t offset,
                 bool store = true);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
+                const loop_layer & loop, int ctrl);
 
         // AMB_INK_* (C3, default off): graph cleanups and fused ops, see amb_ink_flags
         bool ink_lean  = false; // AMB_INK_GRAPH_LEAN, n_tokens <= 8 (C3c; C3 was n_tokens == 1)
@@ -2594,10 +2623,11 @@ struct llama_model_inkling2 : public llama_model_base {
         // AMB_INK_PF_CHECK: at n_tokens > 8 only the first pf_check_sites sites per kind keep a reference
         bool ink_check_want(const char * site) const;
         void ink_check_add(const char * site, ggml_tensor * fused, ggml_tensor * ref);
-        ggml_tensor * mix_unfused(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
-        ggml_tensor * control_unfused(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module);
+        ggml_tensor * mix_unfused(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il);
+        // AMB_INK_FUSE_CHECK reference of the fused controller: the formula the fused tail reproduces bit for bit
+        ggml_tensor * control_ref(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
         // clip with the optional tau multiply after it
-        ggml_tensor * clip_tau(ggml_tensor * cur, ggml_tensor * scale, float threshold, ggml_tensor * tau, const char * site);
+        ggml_tensor * clip_tau(ggml_tensor * cur, ggml_tensor * scale, float threshold, ggml_tensor * tau, int il, const char * site);
         // convolve plus the optional residual add, fused when ink_conv
         ggml_tensor * convolve_res(
                 ggml_tensor * cur,
@@ -2609,9 +2639,90 @@ struct llama_model_inkling2 : public llama_model_base {
                 int64_t offset,
                 ggml_tensor * residual,
                 const char * site);
+        // AMB_INK_GRAPH_LEAN / AMB_INK_FUSE_MIX (C3): the mixes already built in this graph, by device, blocks, cur, query
+        // and layout (a later pass restarts from the prelude, so its core-start attention mix is the one of pass 0)
+        std::map<std::pair<std::pair<ggml_backend_dev_t, bool>, std::vector<ggml_tensor *>>, ggml_tensor *> ink_mixed;
+
+    protected:
+        // the helpers alone, a derived graph builds its own body
+        struct no_build {};
+        graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
+
+        // the inputs and the token embeddings
+        ggml_tensor * build_inputs();
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
+        // msgs (AMB_INK_FUSE_MIX, C3): in place of messages, the LOOP_CTRL_COUNT messages [n_embd, n_tokens] one by one
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr, ggml_tensor * const * msgs = nullptr);
+        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // banded flash attention for layer il on its device and cache
+        bool use_banded(int il, bool swa);
+        std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
+        // [base, swa] contiguous mask of the banded attention, shared by the layers of a graph
+        ggml_tensor * mask_banded[2] = { nullptr, nullptr };
+        // query rows of the dense bias the first banded full-attention layer also builds in the reserve graph:
+        // the small ubatches that stay dense take that bias at runtime, the reserve must hold it
+        int64_t n_rows_dense_reserve = 0;
+
+        llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
+        llm_graph_input_attn_kv_iswa        * attn = nullptr;
+        llm_graph_input_rs                  * recr = nullptr;
+
+        ggml_tensor * inp_out_ids = nullptr;
+        ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // the normalized block stacks of mix(), per block list
+        struct block_stack {
+            ggml_tensor * states   = nullptr;
+            ggml_tensor * states_t = nullptr;
+        };
+        std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> block_stacks;
+        // the rows of each mix, the stack of its blocks and its current input last
+        std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> mix_states;
+        const block_stack * stack(const std::vector<ggml_tensor *> & blocks, int il);
+
+        // the clip thresholds, per layer device, row count and threshold (and the zero sinks, keyed by -n_head)
+        std::map<std::pair<std::pair<ggml_backend_dev_t, int64_t>, float>, ggml_tensor *> clip_limits;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass
+struct llama_model_inkling2_loop : public llama_model_inkling2 {
+    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    void post_arch_tensors(llama_model_loader & ml) override;
+
+    int n_layer_phys() const override { return n_phys; }
+    int layer_phys(int il) const;
+    void load_legacy_hparams();
+
+    int      n_phys     = 0;
+    uint32_t core_start = 0;
+    uint32_t core_end   = 0;
+    uint32_t n_passes   = 0;
+    uint32_t gate_rank  = 0;
+    bool     varying    = false; // trained for a varying number of passes
+    bool     legacy     = false; // earlier inkling2 looped layout, one block per visit
+
+    // indexed by physical layer - core_start
+    std::vector<loop_layer> loop_layers;
+
+    // legacy layout: the message queries of all core layers, {n_embd, 2*(core_end - core_start)} each
+    ggml_tensor * legacy_res_query    = nullptr;
+    ggml_tensor * legacy_kv_res_query = nullptr;
+
+    struct graph : public llama_model_inkling2::graph {
+        graph(const llm_graph_params & params);
+        ggml_tensor * legacy_query(int i) const;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // every cache slot runs on the device of the physical layer it shares the weights of
+    int32_t layer_weights(int32_t il) const override { return layer_phys(il); }
 };
 
 struct llama_model_lfm2 : public llama_model_base {
@@ -2972,7 +3083,7 @@ struct llama_model_clef : public llama_model_qwen35 {
                  input_decision * inp);
 
         ggml_tensor * build_head_norm(ggml_tensor * cur, const norm & n);
-        ggml_tensor * build_head_attn(ggml_tensor * q, ggml_tensor * kv, const attn & a);
+        ggml_tensor * build_head_attn(ggml_tensor * q, ggml_tensor * kv, const attn & a, ggml_tensor * kq_mask = nullptr);
         ggml_tensor * build_head_ffn (ggml_tensor * cur, const head_layer & layer);
 
         const llama_model_clef & model;

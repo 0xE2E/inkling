@@ -22,9 +22,11 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -64,6 +66,14 @@
 #define GGML_CUDA_CC_OFFSET_AMD      0x1000000
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
+
+// datacenter Blackwell (sm_100 / sm_103: B200, B300); consumer Blackwell is GGML_CUDA_CC_BLACKWELL
+#define GGML_CUDA_CC_IS_BLACKWELL_DC(cc) (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 1000 && cc < 1100)
+// GPUs with the small-batch decode tuning (MMVF / vector FA at 2-8 tokens): NVIDIA from Turing on, except Hopper.
+// Measured faster on T4 (7.5), A100 (8.0), L4 (8.9), B200 (10.0), RTX PRO 6000 (12.0); Hopper (9.x) is not measured,
+// so it keeps the previous choice.
+#define GGML_CUDA_CC_HAS_SMALL_BATCH_TUNING(cc) (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && \
+    !(cc >= GGML_CUDA_CC_HOPPER && cc < 1000))
 
 // AMD
 // GCN/CDNA, wave size is 64
@@ -911,7 +921,7 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
     // but CDNA3 supports only e4m3_fnuz (no inf).
     const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
     const __hip_fp8_e4m3_fnuz xf = *reinterpret_cast<const __hip_fp8_e4m3_fnuz *>(&bits);
-    return static_cast<float>(xf) / 2;
+    return static_cast<float>(xf);
 #else
 #if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
     const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
@@ -1046,6 +1056,12 @@ static const uint3 init_fastdiv_values(uint64_t d_64) {
     uint32_t L = 0;
     while (L < 32 && (uint32_t{ 1 } << L) < d) {
         L++;
+        if (L == 32) {
+            // Shifting uint32_t by 32 to the right is undefined behavior.
+            // On NVIDIA it will produce 0.
+            // On AMD the value by which is shifted is masked with & 31 so it is shifting by 0 bits.
+            GGML_ABORT("undefined behavior in fastdiv");
+        }
     }
 
     uint32_t mp = (uint32_t) ((uint64_t{ 1 } << 32) * ((uint64_t{ 1 } << L) - d) / d + 1);
@@ -1408,7 +1424,57 @@ struct ggml_tensor_extra_gpu {
 
 // defined in graph.cuh
 struct ggml_cuda_graph;
+
+// AMB_H2D_ZC: counters of one backend context (printed and reset by its stats line)
+struct ggml_cuda_amb_zc_stats {
+    std::atomic<uint64_t> calls{0}, copies{0}, bytes{0}, narrow{0}, checked{0}, attempts{0};
+    std::atomic<uint64_t> fb_not_pinned{0}, fb_capturing{0}, fb_not_compute{0}, fb_too_big{0};
+    std::atomic<uint64_t> fb_pending_err{0}, fb_launch_err{0}, skipped_not_h2d{0};
+};
 struct ggml_cuda_stream_context;
+
+// a MUL_MAT src1 quantized for MMVQ or MMQ, kept from one MUL_MAT node to the next one that reads the same tensor
+// (GGML_CUDA_DISABLE_Q8_1_REUSE=1 turns it off). The graph evaluation loop enables it for MUL_MAT nodes on one stream
+// and drops it at the start and end of a graph and after any node whose output overlaps the quantized tensor.
+// The buffer is a pool allocation: it is freed only between nodes, when it is the top of the pool stack.
+struct ggml_cuda_src1_cache {
+    bool                enabled = false;
+    const ggml_tensor * src1    = nullptr;
+    const void        * data    = nullptr;
+    int64_t             ne[GGML_MAX_DIMS] = {};
+    size_t              nb[GGML_MAX_DIMS] = {};
+    int                 layout  = -1;
+    ggml_cuda_pool    * pool    = nullptr;
+    void              * ptr     = nullptr;
+    size_t              size    = 0;
+    int64_t             n_hit   = 0;
+    int64_t             n_miss  = 0;
+
+    void release() {
+        if (ptr) {
+            pool->free(ptr, size);
+        }
+        src1 = nullptr;
+        data = nullptr;
+        pool = nullptr;
+        ptr  = nullptr;
+        size = 0;
+    }
+
+    // after a node ran: drop the cache when the node wrote memory of the quantized tensor
+    void invalidate_if_written(const ggml_tensor * node) {
+        if (!src1 || !node->data) {
+            return;
+        }
+        const char * lo  = (const char *) data;
+        const char * hi  = lo + ggml_nbytes(src1);
+        const char * nlo = (const char *) node->data;
+        const char * nhi = nlo + ggml_nbytes(node);
+        if (nlo < hi && lo < nhi) {
+            release();
+        }
+    }
+};
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1424,6 +1490,14 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+
+    // AMB_H2D_ZC: true once this backend has run a graph (its stream is a compute stream; private upload backends
+    // that only copy never set it and keep the DMA path), plus the AMB_H2D_ZC_CHECK scratch buffers
+    std::atomic<bool> amb_zc_compute{false};
+    ggml_cuda_amb_zc_stats amb_zc_stats; // this backend's counters (per context, not process-wide)
+    void *  amb_zc_scratch     = nullptr;
+    size_t  amb_zc_scratch_len = 0;
+    int *   amb_zc_flag        = nullptr;
 
 #ifdef USE_CUDA_GRAPH
     // Map from graph key to cuda_graph - allows multiple graphs per context when the
@@ -1500,6 +1574,8 @@ struct ggml_backend_cuda_context {
     }
 #endif
 
+    ggml_cuda_src1_cache src1_cache;
+
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
@@ -1516,6 +1592,32 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// the buffer for src1 quantized with `layout` (nbytes or more) when the src1 cache is on, else nullptr;
+// *hit is set when the buffer already holds src1 in that layout, so that the quantization can be skipped
+static inline void * ggml_cuda_src1_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int layout, size_t nbytes, bool * hit) {
+    ggml_cuda_src1_cache & c = ctx.src1_cache;
+    *hit = false;
+    if (!c.enabled || !ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (c.src1 == src1 && c.data == src1->data && c.layout == layout && c.size >= nbytes && c.pool == &ctx.pool() &&
+            memcmp(c.ne, src1->ne, sizeof(c.ne)) == 0 && memcmp(c.nb, src1->nb, sizeof(c.nb)) == 0) {
+        *hit = true;
+        c.n_hit++;
+        return c.ptr;
+    }
+    c.release();
+    c.pool   = &ctx.pool();
+    c.ptr    = c.pool->alloc(nbytes, &c.size);
+    c.src1   = src1;
+    c.data   = src1->data;
+    c.layout = layout;
+    memcpy(c.ne, src1->ne, sizeof(c.ne));
+    memcpy(c.nb, src1->nb, sizeof(c.nb));
+    c.n_miss++;
+    return c.ptr;
+}
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

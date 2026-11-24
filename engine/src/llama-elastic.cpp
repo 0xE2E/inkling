@@ -81,7 +81,8 @@ uint32_t unit_from_env() {
 }
 
 bool llama_elastic_arch_ok(llm_arch arch) {
-    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_INKLING2;
+    // b12649: a looped Inkling 2 (both GGUF layouts) loads as inkling2_loop
+    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP;
 }
 
 static int llama_elastic_env_flag(const char * name) {

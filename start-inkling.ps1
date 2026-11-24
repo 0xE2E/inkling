@@ -9,8 +9,8 @@
   borrowed prefill upload ring, and the exact or KLD-checked fusions. 128k context by default.
 
   On five replayed real agent sessions at a 128k window this profile measured
-  prefill ~2,330 tok/s (cold 43k prompt) and decode ~89 tok/s at 43k / ~81 tok/s at ~85k
-  (61-104 by draft acceptance) on an RTX 5080 Laptop GPU (16 GB).
+  prefill ~2,700 tok/s (cold 42k prompt), ~2,230 tok/s (incremental to ~83k) and decode
+  ~93 tok/s at ~42k / ~87 tok/s at ~83k (76-121 by draft acceptance) on an RTX 5080 Laptop GPU (16 GB).
 
   Paths come from parameters or from environment variables:
     INK_BIN     folder that contains llama-server.exe
@@ -89,6 +89,7 @@ if (-not $Stock) {
         AMB_INK_PF_BIAS = '1'; AMB_INK_PF_CTRL = '1'; AMB_INK_PF_MIX = '1'
         AMB_PF_OVERLAP = '1'; AMB_PF_OVERLAP_SLOTS = '3'
         AMB_MOE_SCALE_DEV = '1'
+        AMB_H2D_ZC = '1'; AMB_FA_VERIFY = '1'
     }
     if (-not $NoDraft) {
         $envs.AMB_DSPARK_TRIM = '1'; $envs.AMB_DSPARK_IDS = '1'; $envs.AMB_DSPARK_HEAD_WH = '1'; $envs.AMB_DSPARK_ADAPT = '1'

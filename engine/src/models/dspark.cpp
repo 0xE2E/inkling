@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include "models.h"
 
+#include <cfloat>
+
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -77,38 +79,6 @@ void llama_model_dflash::load_hparams_mistral_large4(llama_model_loader & ml) {
     hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
 }
 
-// Inkling2 DSpark backbone: per-layer target feature mixtures, separate context K/V projections, recurrent markov head
-void llama_model_dflash::load_hparams_inkling2(llama_model_loader & ml) {
-    ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab_padded);
-    ml.get_key(LLM_KV_VOCAB_SIZE_UNPADDED, hparams.n_vocab_unpadded);
-    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
-    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
-    uint32_t n_pattern = 0;
-    ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern);
-    if (hparams.dflash_block_size != 8 ||
-            hparams.dspark_markov_rank > hparams.n_embd || !hparams.n_swa || hparams.n_swa >= INT32_MAX ||
-            n_pattern != hparams.n_layer() || target_layer_ids.size() < 2 ||
-            target_layer_ids.front() < 0 || target_layer_ids.back() > LLAMA_MAX_LAYERS ||
-            std::adjacent_find(target_layer_ids.begin(), target_layer_ids.end(), std::greater_equal<int32_t>()) != target_layer_ids.end() ||
-            !hparams.n_vocab_unpadded || hparams.n_vocab_unpadded > hparams.n_vocab_padded || hparams.n_vocab_unpadded > (1u << 24) ||
-            !std::isfinite(hparams.f_norm_rms_eps) || hparams.f_norm_rms_eps <= 0 ||
-            !std::isfinite(hparams.f_final_logit_softcapping) || hparams.f_final_logit_softcapping <= 0) {
-        throw std::runtime_error("invalid Inkling2 DSpark metadata");
-    }
-    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-        if (!hparams.n_head_kv(il) || hparams.n_head(il) % hparams.n_head_kv(il) ||
-                hparams.n_embd_head_k(il) != hparams.n_embd_head_v(il) || !hparams.n_ff(il) ||
-                hparams.n_rot(il) != hparams.n_embd_head_k(il) || hparams.n_rot(il) % 2) {
-            throw std::runtime_error("invalid Inkling2 DSpark attention dimensions");
-        }
-    }
-    // The anchor row includes the anchor and the window before it.
-    hparams.n_swa += 1;
-    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    hparams.rope_freq_base_train_swa = hparams.rope_freq_base_train;
-    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
-}
-
 // DSpark = DFlash + a semi-autoregressive Markov head and Confidence head
 void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
     LLAMA_LOAD_LOCALS;
@@ -118,12 +88,26 @@ void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
     dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
     dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
     dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
+    dspark_markov_w2_b = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "bias"),   { n_vocab_draft }, TENSOR_NOT_REQUIRED);
 
     dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
     dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
 
-    dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), { n_embd + 2*dspark_markov_rank, 3*dspark_markov_rank }, TENSOR_NOT_REQUIRED);
+    // f_rnn: the rnn head also reads a mix of the target features of the last committed token
+    const int64_t n_joint = (hparams.dspark_f_rnn ? 2*n_embd : n_embd) + 2*dspark_markov_rank;
+
+    dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), { n_joint, 3*dspark_markov_rank }, TENSOR_NOT_REQUIRED);
     dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"),   { 3*dspark_markov_rank }, dspark_joint_proj ? 0 : TENSOR_NOT_REQUIRED);
+
+    if (hparams.dspark_f_rnn) {
+        dspark_markov_ctx_mix  = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_CTX_MIX,  "weight"), { (int64_t) target_layer_ids.size() }, 0);
+        dspark_markov_ctx_norm = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_CTX_NORM, "weight"), { n_embd }, 0);
+    }
+
+    // the ML4 backbone loads its own mask_embd
+    if (backbone == BACKBONE_BASE) {
+        dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), { n_embd, hparams.dflash_block_size - 1 }, TENSOR_NOT_REQUIRED);
+    }
 
     LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
 }
@@ -210,47 +194,168 @@ void llama_model_dflash::load_tensors_layers_mistral_large4() {
     }
 }
 
-void llama_model_dflash::load_tensors_inkling2() {
+void llama_model_dflash::load_tensors_inkling2_head() {
     LLAMA_LOAD_LOCALS;
-
-    const int64_t rank = hparams.dspark_markov_rank;
-    if (hparams.n_vocab_unpadded != (uint32_t) n_vocab) {
-        throw std::runtime_error("Inkling2 DSpark vocabulary size mismatch");
+    const int64_t rank = hparams.dspark_context_rank;
+    if (n_vocab != hparams.n_vocab_unpadded || n_vocab > hparams.n_vocab_padded) {
+        throw std::runtime_error("Inkling2 DSpark tokenizer does not match the unpadded vocabulary");
     }
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    dspark_mask_embd = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD, "weight"), {n_embd}, 0);
-    dspark_fuse = create_tensor(tn(LLM_TENSOR_DSPARK_FUSE, "weight"), {(int64_t) target_layer_ids.size(), n_layer + 1}, 0);
-    dspark_norm = create_tensor(tn(LLM_TENSOR_DSPARK_NORM, "weight"), {n_embd}, 0);
-    dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), {rank, hparams.n_vocab_padded}, 0);
-    dspark_joint_proj = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), {2*rank + 2*n_embd, 3*rank}, 0);
-    dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"), {3*rank}, 0);
-    dspark_hidden_out = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "weight"), {rank, n_embd}, 0);
-    dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "bias"), {n_embd}, 0);
-    for (int i = 0; i < n_layer; ++i) {
-        auto & l = layers[i];
-        const int64_t hd = hparams.n_embd_head_k(i);
-        const int64_t q = hd*hparams.n_head(i);
-        const int64_t kv = hd*hparams.n_head_kv(i);
-        l.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-        l.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        l.dflare_norm = create_tensor(tn(LLM_TENSOR_DFLARE_NORM, "weight", i), {n_embd}, 0);
-        l.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, q}, 0);
-        l.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, kv}, 0);
-        l.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, kv}, 0);
-        l.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {q, n_embd}, 0);
-        l.attn_k_ctx = create_tensor(tn(LLM_TENSOR_ATTN_K_CTX, "weight", i), {n_embd, kv}, 0);
-        l.attn_v_ctx = create_tensor(tn(LLM_TENSOR_ATTN_V_CTX, "weight", i), {n_embd, kv}, 0);
-        l.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {hd}, 0);
-        l.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {hd}, 0);
-        l.attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_CTX_NORM, "weight", i), {hd}, 0);
-        l.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, hparams.n_ff(i)}, 0);
-        l.ffn_up = create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", i), {n_embd, hparams.n_ff(i)}, 0);
-        l.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {hparams.n_ff(i), n_embd}, 0);
+    output_norm         = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,       "weight"), {n_embd}, 0);
+    dspark_mask_embd    = create_tensor(tn(LLM_TENSOR_DSPARK_MASK_EMBD,  "weight"), {n_embd}, 0);
+    dspark_fuse         = create_tensor(tn(LLM_TENSOR_DSPARK_FUSE,       "weight"), {(int64_t) target_layer_ids.size(), n_layer + 1}, 0);
+    dspark_norm         = create_tensor(tn(LLM_TENSOR_DSPARK_NORM,       "weight"), {n_embd}, 0);
+    dspark_markov_w1    = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1,  "weight"), {rank, hparams.n_vocab_padded}, 0);
+    dspark_joint_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "weight"), {2*n_embd + 2*rank, 3*rank}, 0);
+    dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"),   {3*rank}, 0);
+    dspark_hidden_out   = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "weight"), {rank, n_embd}, 0);
+    dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "bias"),   {n_embd}, 0);
+    for (int il = 0; il < n_layer; ++il) {
+        auto & layer = layers[il];
+        layer.dflare_norm     = create_tensor(tn(LLM_TENSOR_DFLARE_NORM,     "weight", il), {n_embd}, 0);
+        layer.dflash_wk_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX,      "weight", il), {n_embd, n_embd_k_gqa}, 0);
+        layer.dflash_wv_ctx          = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_V_CTX,      "weight", il), {n_embd, n_embd_v_gqa}, 0);
+        layer.dflash_attn_k_ctx_norm = create_tensor(tn(LLM_TENSOR_DFLASH_ATTN_K_CTX_NORM, "weight", il), {n_embd_head_k}, 0);
     }
 }
 
+ggml_tensor * llama_model_dflash::graph_base::mix_target_features(ggml_tensor * features, int row, ggml_tensor * norm) {
+    const int64_t count = model.target_layer_ids.size();
+    auto * weights = ggml_soft_max(ctx0, ggml_view_1d(ctx0, model.dspark_fuse, count, row*model.dspark_fuse->nb[1]));
+    auto * x = ggml_reshape_3d(ctx0, features, n_embd, count, n_tokens);
+    x = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3));
+    x = ggml_sum_rows(ctx0, ggml_mul(ctx0, x, weights));
+    return build_norm(ggml_reshape_2d(ctx0, x, n_embd, n_tokens), norm, nullptr, LLM_NORM_RMS, -1);
+}
+
+ggml_tensor * llama_model_dflash::graph_base::build_inkling2_embd(ggml_tensor * inp_tokens) {
+    const auto & target = *llama_get_model(cparams.ctx_other);
+    if ((target.arch != LLM_ARCH_INKLING2 && target.arch != LLM_ARCH_INKLING2_LOOP) ||
+            target.hparams.n_embd != hparams.n_embd || !target.tok_norm || !target.output ||
+            target.output->ne[1] != hparams.n_vocab_padded) {
+        throw std::runtime_error("Inkling2 DSpark requires a matching Inkling2 target");
+    }
+    const int64_t n_seq = ubatch.n_seqs_unq;
+    GGML_ASSERT(n_seq > 0 && n_tokens % n_seq == 0 && "Inkling2 DSpark requires equal-size blocks");
+    const int64_t rows = n_tokens/n_seq;
+    auto * anchor = ggml_cont_1d(ctx0, ggml_view_2d(ctx0, inp_tokens, 1, n_seq, rows*inp_tokens->nb[0], 0), n_seq);
+    auto * inpL = ggml_get_rows(ctx0, target.tok_embd, anchor);
+    inpL = ggml_mul(ctx0, ggml_rms_norm(ctx0, inpL, target.hparams.f_norm_rms_eps), target.tok_norm);
+    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_seq);
+    if (rows > 1) {
+        auto * masks = ggml_repeat_4d(ctx0, model.dspark_mask_embd, n_embd, rows - 1, n_seq, 1);
+        inpL = ggml_concat(ctx0, inpL, masks, 1);
+    }
+    inpL = ggml_reshape_2d(ctx0, inpL, n_embd, n_tokens);
+    inp_attn_iswa->self_attn_mask_swa.block_uniform = true;
+    return inpL;
+}
+
+static ggml_tensor * dspark_recurrent_step(ggml_context * ctx, const llama_model & model,
+        ggml_tensor * & state, ggml_tensor * prev_embd, ggml_tensor * features) {
+    auto * joint = ggml_concat(ctx, ggml_concat(ctx, state, prev_embd, 0), features, 0);
+    joint = ggml_add(ctx, ggml_mul_mat(ctx, model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
+    const int64_t rank = state->ne[0];
+    const auto chunk = [&](int k) {
+        return ggml_cont(ctx, ggml_view_2d(ctx, joint, rank, joint->ne[1], joint->nb[1], k*rank*joint->nb[0]));
+    };
+    auto * gate = ggml_sigmoid(ctx, chunk(0));
+    auto * cand = ggml_tanh(ctx, chunk(1));
+    state = ggml_add(ctx, cand, ggml_mul(ctx, gate, ggml_sub(ctx, state, cand)));
+    return ggml_tanh(ctx, chunk(2));
+}
+
+// AMB_DSPARK_TRIM=1 (C3c, default off). In this tree it does, per draft call, the drafter work our b12588 engine did:
+//   * fused Inkling2 drafter (dspark_hidden_out): the base logits W_out x hidden of the block come from one pass over the
+//     output head for all block rows (as graph_inkling2 did), not from one W_out matvec per chain step
+//   * f_rnn drafter (markov_w2): greedy drafts ask for the logits of positions 1..n_max only, the chain stops there and
+//     picks the argmax directly (no top-k / sort / cumsum draw machinery, which a greedy draw reduces to the argmax anyway)
+static bool amb_dspark_trim_on() {
+    static const bool on = [] {
+        const char * v = getenv("AMB_DSPARK_TRIM");
+        const bool o = v != nullptr && strcmp(v, "1") == 0;
+        if (o) {
+            LLAMA_LOG_INFO("amb_dspark_trim: AMB_DSPARK_TRIM=1 active (fused drafter: one output-head pass per block; "
+                "f_rnn drafter: the chain stops at the last requested position)\n");
+        }
+        return o;
+    }();
+    return on;
+}
+
+// AMB_DSPARK_IDS=1|2 (D1, default off; with the trimmed f_rnn chain only): the chain writes id + 1 into element 0 of the
+// h_nextn row of each drafted position. 1: no logits output (no backend sampler chains, no host pass over the vocabulary);
+// 2: check mode, logits kept and the host compares. The fused drafter already returns its ids from the graph (t_sampled).
+static int amb_dspark_ids_mode() {
+    static const int mode = [] {
+        const char * v = getenv("AMB_DSPARK_IDS");
+        const int m = v != nullptr && (strcmp(v, "1") == 0 || strcmp(v, "2") == 0) ? atoi(v) : 0;
+        if (m != 0) {
+            LLAMA_LOG_INFO("amb_dspark_ids: AMB_DSPARK_IDS=%d: the trimmed f_rnn DSpark chain writes its draft ids into the "
+                "h_nextn rows%s\n", m, m == 1 ? ", the draft logits are not output" : " (check mode: logits kept)");
+        }
+        return m;
+    }();
+    return mode;
+}
+
+// base_pre: W_out x hidden computed by the caller (AMB_DSPARK_TRIM, one pass over the output head for the whole block),
+// nullptr: computed here for the rows of hidden
+static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model & model, ggml_tensor * & state,
+        ggml_tensor * prev, ggml_tensor * features, ggml_tensor * hidden, ggml_tensor * base_pre = nullptr) {
+    auto * prev_embd = ggml_get_rows(g.ctx0, model.dspark_markov_w1, prev);
+    ggml_set_name(prev_embd, "dspark_prev_embd");
+    auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
+    const auto [output, scale] = llama_model_dflash::get_lm_head(g, model);
+    ggml_tensor * base = base_pre;
+    if (base == nullptr) {
+        base = g.build_lora_mm(output, hidden, scale);
+        ggml_prec_set_acc(base, GGML_PREC_F32);
+    }
+    ggml_tensor * bias;
+    if (model.amb_dspark_wh != nullptr && model.amb_dspark_wb != nullptr && scale == nullptr) {
+        // AMB_DSPARK_HEAD_WH (M3): W_out (H latent + b) = (W_out H) latent + W_out b, with both products computed once at
+        // context creation: a [n_vocab, rank] matvec instead of a pass over the whole output head per chain step
+        bias = ggml_add(g.ctx0, ggml_mul_mat(g.ctx0, model.amb_dspark_wh, latent), model.amb_dspark_wb);
+        static uint64_t n_sites = 0;
+        if (n_sites++ < 4) {
+            LLAMA_LOG_INFO("amb_dspark_head_wh: draft head step built on the precomputed product (%s [%lld x %lld]; logged for the "
+                "first 4 steps built)\n", ggml_type_name(model.amb_dspark_wh->type),
+                (long long) model.amb_dspark_wh->ne[1], (long long) model.amb_dspark_wh->ne[0]);
+        }
+    } else {
+        auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        bias = g.build_lora_mm(output, correction, scale);
+        ggml_prec_set_acc(bias, GGML_PREC_F32);
+    }
+    auto * logits = ggml_add(g.ctx0, base, bias);
+    logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, hidden->ne[1], logits->nb[1], 0));
+    const float cap = model.hparams.f_final_logit_softcapping;
+    return ggml_scale(g.ctx0, ggml_tanh(g.ctx0, ggml_scale(g.ctx0, logits, 1.0f/cap)), cap);
+}
+
+llama_model_dflash::graph_inkling2_head::graph_inkling2_head(const llm_graph_params & params) : llm_graph_context(params) {
+    const int64_t rank = hparams.dspark_context_rank;
+    const int64_t width = 3*n_embd;
+    auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, width);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+    inp->h = build_inp_embd_state(inp.get(), width);
+    auto * state = ggml_view_2d(ctx0, inp->h, rank, n_tokens, inp->h->nb[1], 0);
+    auto * features = ggml_view_2d(ctx0, inp->h, 2*n_embd, n_tokens, inp->h->nb[1], n_embd*sizeof(float));
+    auto * hidden = ggml_view_2d(ctx0, features, n_embd, n_tokens, features->nb[1], 0);
+    res->t_logits = inkling2_head_step(*this, model, state, inp->tokens, features, hidden);
+    res->t_h_nextn = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
+    ggml_build_forward_expand(gf, res->t_h_nextn);
+    res->add_input(std::move(inp));
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr) {
+// rnn_state: [n_embd, n_tokens] per-token state of the Inkling2 rnn head (see llama_batch_ext_select_n_embd_state)
+//   anchor row: f_rnn, an extra rnn input; draft row i: [uniform | 1/temp | 0...] of its draw
+//   each step draws its token at 1/temp (0: argmax) and packs [token, k, ids, probs] into h_nextn
+// softcap_after_bias: softcap(base + bias) instead of leaving the logits uncapped
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr,
+        ggml_tensor * rnn_state = nullptr, bool softcap_after_bias = false) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -294,22 +399,110 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
     prev = ggml_cont_1d(ctx0, prev, n_blocks);
 
+    const int64_t n_embd = g.hparams.n_embd;
+
+    // n_rows values from offset off of the state at block position i, [n_rows, n_blocks]
+    const auto state_rows = [&](int64_t n_rows, int64_t off, int64_t i) {
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, rnn_state, n_rows, n_blocks, (size_t) block_drafts * rnn_state->nb[1],
+                i*rnn_state->nb[1] + off*ggml_element_size(rnn_state)));
+    };
+
+    ggml_tensor * f_rnn     = nullptr; // [n_embd, n_blocks]
+    ggml_tensor * inv_temp  = nullptr; // [1, n_blocks]
+    ggml_tensor * is_greedy = nullptr; // [1, n_blocks], 1 when inv_temp is 0
+    if (rnn_state) {
+        // the anchor row holds f_rnn, so it cannot be a draft row
+        GGML_ASSERT(!has_conf && !sample_from_anchor && rnn_state->ne[0] == n_embd);
+        f_rnn = state_rows(n_embd, 0, 0);
+        if (block_drafts > i_draft_beg) {
+            inv_temp  = state_rows(1, 1, i_draft_beg);
+            is_greedy = ggml_scale_bias(ctx0, ggml_step(ctx0, inv_temp), -1.0f, 1.0f);
+        }
+    }
+
+    // the draws keep the top n_cand candidates, q of the verifier is their distribution
+    const int64_t n_cand = std::min<int64_t>(64, n_vocab);
+    GGML_ASSERT(!rnn_state || 2 + 2*n_cand <= n_embd);
+
+    // draw the token of block position i from softmax(top_k(col) * inv_temp), like the backend dist sampler
+    // returns [n_embd, n_blocks] packed rows [token, n_cand, ids, probs] and sets the next prev
+    const auto draw = [&](ggml_tensor * col, int64_t i, ggml_tensor *& next) {
+        ggml_tensor * ids   = ggml_top_k(ctx0, col, n_cand); // [n_cand, n_blocks], unordered
+        ggml_tensor * vals  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, col, 1, n_vocab, n_blocks), ids), n_cand, n_blocks);
+
+        // the top-k order can change between runs, sort by logit so a seed draws the same tokens
+        ggml_tensor * order = ggml_argsort(ctx0, vals, GGML_SORT_ORDER_DESC);
+        ids  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids,  1, n_cand, n_blocks), order), n_cand, n_blocks);
+        vals = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, vals, 1, n_cand, n_blocks), order), n_cand, n_blocks);
+
+        ggml_tensor * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, vals, inv_temp));
+
+        // index of the first candidate whose cumulative probability passes the uniform
+        ggml_tensor * n_over = ggml_sum_rows(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), state_rows(1, 0, i))));
+        ggml_tensor * idx    = ggml_cast(ctx0, ggml_scale_bias(ctx0, ggml_clamp(ctx0, n_over, 1.0f, (float) n_cand), -1.0f, (float) n_cand), GGML_TYPE_I32);
+
+        ggml_tensor * ids_f  = ggml_cast(ctx0, ids, GGML_TYPE_F32);
+        ggml_tensor * drawn  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids_f, 1, n_cand, n_blocks), idx), 1, n_blocks);
+        ggml_tensor * argmax = ggml_reshape_2d(ctx0, ggml_cast(ctx0, ggml_argmax(ctx0, col), GGML_TYPE_F32), 1, n_blocks);
+
+        // greedy keeps the exact argmax
+        ggml_tensor * tok = ggml_add(ctx0, drawn, ggml_mul(ctx0, is_greedy, ggml_sub(ctx0, argmax, drawn)));
+        next = ggml_cast(ctx0, ggml_reshape_1d(ctx0, tok, n_blocks), GGML_TYPE_I32);
+
+        ggml_tensor * k_col = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_blocks), (float) n_cand);
+        ggml_tensor * row   = ggml_concat(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, tok, k_col, 0), ids_f, 0), probs, 0);
+        return ggml_pad(ctx0, row, n_embd - row->ne[0], 0, 0, 0);
+    };
+
+    const float softcap = softcap_after_bias ? g.hparams.f_final_logit_softcapping : 0.0f;
+
+    // AMB_DSPARK_TRIM=1 (default off, f_rnn chain only): the host asks for the logits of block positions 1..m only (m =
+    // n_max, greedy drafts only, see common_speculative_impl_draft_dspark::draft), so the chain stops at m and each step
+    // takes the argmax directly. The chain is causal (step i reads steps < i only) and a greedy draw is exactly the
+    // argmax (tok = drawn + 1 * (argmax - drawn) on integers < 2^24), so the steps kept compute the same tokens.
+    // The logits come out in output order (per block, positions 1..m); h_nextn keeps one row per token.
+    int64_t i_chain_end = block_drafts; // exclusive
+    bool    trim        = false;
+    if (rnn_state && !sample_from_anchor && amb_dspark_trim_on() && g.ubatch.output != nullptr &&
+            (int64_t) g.n_outputs < n_tok && g.n_outputs > 0 && (int64_t) g.n_outputs % n_blocks == 0) {
+        const int64_t m = (int64_t) g.n_outputs / n_blocks;
+        bool ok = m >= 1 && m <= block_drafts - 1;
+        for (int64_t b = 0; ok && b < n_blocks; ++b) {
+            for (int64_t i = 0; ok && i < block_drafts; ++i) {
+                ok = (g.ubatch.output[b*block_drafts + i] != 0) == (i >= 1 && i <= m);
+            }
+        }
+        if (ok) {
+            i_chain_end = m + 1;
+            trim        = true;
+        }
+    }
+    // AMB_DSPARK_IDS (trimmed chain only): h_nextn row of position i = [id + 1 | zeros] (0 = no id); 1: no logits output
+    const int ids_mode = trim && n_embd >= 1 ? amb_dspark_ids_mode() : 0;
+
     ggml_tensor * cat      = nullptr;
     ggml_tensor * cat_conf = nullptr;
+    ggml_tensor * cat_draw = nullptr;
 
     if (!sample_from_anchor) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
-        cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        // (trimmed: the anchor row is not an output)
+        if (!trim) {
+            cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        }
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
+        }
+        if (rnn_state) {
+            cat_draw = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_blocks), 0.0f);
         }
     }
 
     ggml_tensor * state = nullptr; // [R, n_blocks]
 
-    // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
+    // TODO: without rnn_state the in-graph chain is greedy (argmax); sampling params affect only the final
     //       token pick, not the Markov conditioning path
-    for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
+    for (int64_t i = i_draft_beg; i < i_chain_end; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev); // [R, n_blocks]
         ggml_tensor * markov  = w1_prev;
 
@@ -322,6 +515,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             ggml_tensor * hidden_i = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_blocks,
                                                   (size_t) block_drafts * hidden->nb[1], i*hidden->nb[1]);
             ggml_tensor * joint = ggml_concat(ctx0, ggml_concat(ctx0, state, w1_prev, 0), ggml_cont(ctx0, hidden_i), 0);
+            if (f_rnn) {
+                joint = ggml_concat(ctx0, joint, f_rnn, 0);
+            }
             joint = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dspark_joint_proj, joint), model.dspark_joint_proj_b); // [3R, n_blocks]
 
             const auto chunk = [&](int64_t k) {
@@ -336,6 +532,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
 
         ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        if (model.dspark_markov_w2_b) {
+            bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
+        }
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
@@ -349,8 +548,13 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         // position i of every block: strided view [n_vocab, n_blocks]
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
+        if (softcap > 0.0f) {
+            col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
+        }
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        if (ids_mode != 1) {
+            cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        }
 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
@@ -368,15 +572,63 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (i + 1 < block_drafts) {
+        if (rnn_state && trim) {
+            // AMB_DSPARK_TRIM: greedy, the argmax is the drawn token; the row carries id + 1 for AMB_DSPARK_IDS
+            prev = ggml_argmax(ctx0, col);
+            ggml_tensor * packed = ggml_scale_bias(ctx0, ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, n_blocks), 1.0f, 1.0f);
+            if (n_embd > 1) {
+                packed = ggml_pad(ctx0, packed, n_embd - 1, 0, 0, 0);
+            }
+            cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
+        } else if (rnn_state) {
+            ggml_tensor * packed = draw(col, i, prev);
+            cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
+        } else if (i + 1 < block_drafts) {
             prev = ggml_argmax(ctx0, col);
         }
     }
 
+    if (cat_draw && trim && i_chain_end < block_drafts) {
+        // AMB_DSPARK_TRIM: the positions past the chain get zero rows (one h_nextn row per token)
+        cat_draw = ggml_pad(ctx0, cat_draw, 0, n_blocks*(block_drafts - i_chain_end), 0, 0);
+    }
+
+    if (trim) {
+        static uint64_t n_logged = 0;
+        if (n_logged++ < 2) {
+            LLAMA_LOG_INFO("amb_dspark_trim: f_rnn DSpark chain trimmed to positions 1..%lld of %lld (ids mode %d; logged for "
+                "the first 2 graphs built)\n", (long long) (i_chain_end - 1), (long long) (block_drafts - 1), ids_mode);
+        }
+    }
+
+    if (cat_draw) {
+        // position-major like cat; restore ubatch block-major order
+        ggml_tensor * draws = ggml_reshape_3d(ctx0, cat_draw, n_embd, n_blocks, block_drafts);
+        draws = ggml_cont(ctx0, ggml_permute(ctx0, draws, 0, 2, 1, 3));
+        res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, n_tok);
+        ggml_build_forward_expand(g.gf, res->t_h_nextn);
+    }
+
+    if (ids_mode == 1) {
+        // AMB_DSPARK_IDS=1: the ids are in the h_nextn rows, no logits output (and no backend sampler chains)
+        res->t_logits = nullptr;
+        return;
+    }
+
     // cat is position-major; restore ubatch block-major order
-    ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
-    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
-    out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+    // (trimmed: positions 1..m of each block, which is the output order of the requested rows)
+    const int64_t n_cols = trim ? i_chain_end - 1 : block_drafts;
+    ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, n_cols);
+    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, n_cols, n_blocks]
+    out = ggml_reshape_2d(ctx0, out, n_vocab, n_blocks*n_cols);
+    if (!trim && rnn_state && (int64_t) g.n_outputs < n_tok) {
+        // fewer rows requested than the chain computed (e.g. a trim pattern the graph did not take): the output rows
+        if (g.n_outputs == 0) {
+            res->t_logits = nullptr;
+            return;
+        }
+        out = ggml_get_rows(ctx0, out, g.build_inp_out_ids());
+    }
 
     if (has_conf) {
         ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);
@@ -393,6 +645,133 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_build_forward_expand(g.gf, out);
 }
 
+static ggml_tensor * inkling2_argmax(ggml_context * ctx, ggml_tensor * logits) {
+    // The host sampler takes the lowest ID on ties. Backend argmax tie rules differ.
+    const int64_t n = logits->ne[0];
+    auto * peak = ggml_get_rows(ctx, ggml_reshape_2d(ctx, logits, 1, n), ggml_argmax(ctx, logits));
+    auto * below = ggml_step(ctx, ggml_sub(ctx, ggml_repeat(ctx, peak, logits), logits));
+    auto * rank = ggml_scale_bias(ctx, ggml_arange(ctx, 0, n, 1), -1, n);
+    return ggml_argmax(ctx, ggml_sub(ctx, rank, ggml_scale(ctx, below, n)));
+}
+
+// Integer prefix sums stay exact regardless of the backend scan order.
+static ggml_tensor * inkling2_draw(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * temperature,
+        ggml_tensor * ticket, ggml_tensor * & q) {
+    const int64_t n = logits->ne[0];
+    constexpr float tickets = 16777216.0f;
+    GGML_ASSERT(n > 1 && n <= (1 << 23));
+
+    // A nonfinite logit invalidates the row. Zero logits give a uniform proposal.
+    auto * finite = ggml_step(ctx, ggml_scale_bias(ctx, ggml_abs(ctx, logits), -1.0f, FLT_MAX));
+    auto * valid = ggml_step(ctx, ggml_scale_bias(ctx, ggml_sum(ctx, finite), 1.0f, 0.5f - n));
+    auto * rows = ggml_concat(ctx, ggml_fill(ctx, logits, 0), logits, 1);
+    auto * safe = ggml_get_rows(ctx, rows, ggml_cast(ctx, valid, GGML_TYPE_I32));
+    auto * peak = ggml_get_rows(ctx, ggml_reshape_2d(ctx, safe, 1, n), ggml_argmax(ctx, safe));
+    auto * probs = ggml_soft_max(ctx, ggml_div(ctx, ggml_sub(ctx, safe, peak), temperature));
+
+    int radix = 1;
+    while (radix < 256 && 2LL*radix*n <= (1 << 24)) {
+        radix *= 2;
+    }
+    auto * weights = ggml_scale(ctx, probs, tickets/2);
+    auto * hi = ggml_floor(ctx, weights);
+    auto * fraction = ggml_scale(ctx, ggml_sub(ctx, weights, hi), radix);
+    auto * mid = ggml_floor(ctx, fraction);
+    auto * lo = ggml_round(ctx, ggml_scale(ctx, ggml_sub(ctx, fraction, mid), radix));
+    auto * fine = ggml_add(ctx, ggml_cumsum(ctx, mid), ggml_scale(ctx, ggml_cumsum(ctx, lo), 1.0f/radix));
+    auto * prefix = ggml_add(ctx, ggml_cumsum(ctx, hi), ggml_scale(ctx, fine, 1.0f/radix));
+    auto * total = ggml_view_1d(ctx, prefix, 1, (n - 1)*prefix->nb[0]);
+    auto * inner = ggml_div(ctx, ggml_view_1d(ctx, prefix, n - 1, 0), total);
+    inner = ggml_clamp(ctx, ggml_round(ctx, ggml_scale(ctx, inner, tickets)), 0, tickets);
+
+    auto * upper = ggml_concat(ctx, inner, ggml_fill(ctx, ticket, tickets), 0);
+    auto * lower = ggml_concat(ctx, ggml_fill(ctx, ticket, 0), inner, 0);
+    q = ggml_scale(ctx, ggml_sub(ctx, upper, lower), 1.0f/tickets);
+    auto * above = ggml_step(ctx, ggml_sub(ctx, inner, ticket));
+    return ggml_cast(ctx, ggml_scale_bias(ctx, ggml_sum(ctx, above), -1, n - 1), GGML_TYPE_I32);
+}
+
+struct inkling2_block_input : llm_graph_input_i {
+    ggml_tensor * context;
+    ggml_tensor * draws = nullptr;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        ggml_backend_tensor_set(context, ubatch->embd_state, 0, ggml_nbytes(context));
+        if (draws) {
+            ggml_backend_tensor_set(draws, ubatch->embd_state + context->ne[0], 0, ggml_nbytes(draws));
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.ubatch.embd_state && (params.ubatch.embd_state[context->ne[0]] > 0) == (draws != nullptr);
+    }
+};
+
+void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens, ggml_tensor * hidden) {
+    GGML_ASSERT(ubatch.n_seqs_unq == 1 && n_tokens == hparams.dflash_block_size && n_outputs < n_tokens);
+    auto inp = std::make_unique<inkling2_block_input>();
+    inp->context = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_embd);
+    ggml_set_input(inp->context);
+    if (ubatch.embd_state[n_embd] > 0) {
+        inp->draws = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_outputs + 1);
+        ggml_set_input(inp->draws);
+    }
+    ggml_backend_t backend = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        auto * candidate = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(candidate) == model.dev_output()) {
+            backend = candidate;
+            break;
+        }
+    }
+    auto * prev = ggml_view_1d(ctx0, tokens, 1, 0);
+    auto * state = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.dspark_context_rank), 0);
+    // AMB_DSPARK_TRIM=1: W_out x hidden for the whole block in one pass over the output head (8 rows, as graph_inkling2
+    // of our b12588 engine did), each chain step reads its row; unset: one W_out matvec per step (upstream)
+    ggml_tensor * base_all = nullptr;
+    if (amb_dspark_trim_on()) {
+        const auto [output, scale] = get_lm_head(*this, model);
+        base_all = build_lora_mm(output, hidden, scale);
+        ggml_prec_set_acc(base_all, GGML_PREC_F32);
+        static uint64_t n_logged = 0;
+        if (n_logged++ < 2) {
+            LLAMA_LOG_INFO("amb_dspark_trim: fused Inkling2 block: base logits of %lld rows in one output-head pass, "
+                "%d chain steps (logged for the first 2 graphs built)\n", (long long) hidden->ne[1], (int) n_outputs);
+        }
+    }
+    for (int i = 0; i < n_outputs; ++i) {
+        auto * row = ggml_view_1d(ctx0, hidden, n_embd, (i + 1)*hidden->nb[1]);
+        auto * features = ggml_concat(ctx0, row, inp->context, 0);
+        ggml_tensor * base_i = base_all ? ggml_view_2d(ctx0, base_all, base_all->ne[0], 1, base_all->nb[1], (i + 1)*base_all->nb[1]) : nullptr;
+        auto * logits = inkling2_head_step(*this, model, state, prev, features, row, base_i);
+        ggml_build_forward_expand(gf, logits);
+        const int first = ggml_graph_n_nodes(gf);
+        if (inp->draws) {
+            auto * temp = ggml_view_1d(ctx0, inp->draws, 1, 0);
+            auto * ticket = ggml_view_1d(ctx0, inp->draws, 1, (i + 1)*sizeof(float));
+            ggml_tensor * q;
+            prev = inkling2_draw(ctx0, logits, temp, ticket, q);
+            cb(q, "dspark_q", i);
+            res->t_sampled_probs.push_back(q);
+            res->t_sampling_all.push_back(q);
+            ggml_build_forward_expand(gf, q);
+        } else {
+            prev = inkling2_argmax(ctx0, logits);
+        }
+        cb(prev, "dspark_token", i);
+        res->t_sampled.push_back(prev);
+        res->t_sampling_all.push_back(prev);
+        ggml_build_forward_expand(gf, prev);
+        for (int j = first; backend && j < ggml_graph_n_nodes(gf); ++j) {
+            auto * node = ggml_graph_node(gf, j);
+            if (!node->view_src && ggml_backend_supports_op(backend, node)) {
+                ggml_backend_sched_set_tensor_backend(sched, node, backend);
+            }
+        }
+    }
+    res->add_input(std::move(inp));
+}
+
 llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) : graph_base(params) {
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd || ubatch.embd_row) {
@@ -400,13 +779,48 @@ llama_model_dflash::graph_dspark::graph_dspark(const llm_graph_params & params) 
         return;
     }
 
-    ggml_tensor * inp_tokens = build_inp_tokens();
-    ggml_tensor * cur        = build_layers(inp_tokens);
+    // the Inkling2 rnn head state arrives as the state embedding of the block tokens
+    ggml_tensor * inp_tokens = nullptr;
+    ggml_tensor * rnn_state  = nullptr;
+    if (hparams.dspark_f_rnn && ubatch.embd_state) {
+        inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp_tokens);
+        res->t_inp_tokens = inp_tokens;
 
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
+        inp->tokens = inp_tokens;
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->h);
+        rnn_state = inp->h;
+        res->add_input(std::move(inp));
+    } else {
+        inp_tokens = build_inp_tokens();
+    }
+
+    // the whole block shares the mask row of its first query (the anchor)
+    if (model.dspark_mask_embd && use_iswa) {
+        inp_attn_iswa->self_attn_mask_swa.block_uniform = true;
+    }
+
+    ggml_tensor * cur = build_layers(inp_tokens);
+
+    if (model.dspark_fuse) {
+        if (ubatch.embd_state) {
+            build_inkling2_block(inp_tokens, cur);
+            return;
+        }
+        res->t_h_nextn = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
     build_logits(cur);
 
     // bias the draft logits with the Markov head
-    build_dspark_markov_head(*this, model, inp_tokens);
+    if (!hparams.dspark_f_rnn) {
+        build_dspark_markov_head(*this, model, inp_tokens);
+    } else if (rnn_state) {
+        build_dspark_markov_head(*this, model, inp_tokens, cur, rnn_state, true);
+    }
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see graph_base):
@@ -943,274 +1357,4 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens, cur);
     }
-}
-
-static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
-        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context) {
-    auto * ctx0 = g.ctx0;
-    const int64_t rank = model.hparams.dspark_markov_rank;
-    auto * joint = ggml_concat(ctx0, state, ggml_get_rows(ctx0, model.dspark_markov_w1, prev), 0);
-    joint = ggml_concat(ctx0, joint, ggml_concat(ctx0, hidden, context, 0), 0);
-    joint = ggml_add(ctx0, g.build_lora_mm(model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
-    const auto chunk = [&](int64_t j) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, joint->ne[1], joint->nb[1], j*rank*joint->nb[0]));
-    };
-    auto * gate = ggml_sigmoid(ctx0, chunk(0));
-    auto * candidate = ggml_tanh(ctx0, chunk(1));
-    state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
-    auto * latent = ggml_tanh(ctx0, chunk(2));
-    ggml_tensor * bias;
-    if (model.amb_dspark_wh != nullptr && model.amb_dspark_wb != nullptr) {
-        // AMB_DSPARK_HEAD_WH (M3): W_out (H latent + b) = (W_out H) latent + W_out b, with both products computed once at
-        // context creation: a [n_vocab, rank] matvec instead of a pass over the whole output head per chain step
-        bias = ggml_add(ctx0, ggml_mul_mat(ctx0, model.amb_dspark_wh, latent), model.amb_dspark_wb);
-        static uint64_t n_sites = 0;
-        if (n_sites++ < 4) {
-            LLAMA_LOG_INFO("amb_dspark_head_wh: draft head step built on the precomputed product (%s [%lld x %lld]; logged for the "
-                "first 4 steps built)\n", ggml_type_name(model.amb_dspark_wh->type),
-                (long long) model.amb_dspark_wh->ne[1], (long long) model.amb_dspark_wh->ne[0]);
-        }
-    } else {
-    auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    bias = g.build_lora_mm(target.output, correction, target.output_s);
-    ggml_prec_set_acc(bias, GGML_PREC_F32);
-    }
-    if (bias->ne[0] != base->ne[0]) {
-        bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
-    }
-    auto * logits = ggml_add(ctx0, base, bias);
-    const float cap = model.hparams.f_final_logit_softcapping;
-    return ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, logits, 1.0f/cap)), cap);
-}
-
-// Inkling2 uses separate context projections and one feature mixture per draft layer.
-llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & params) : llm_graph_context(params) {
-    if (params.gtype == LLM_GRAPH_TYPE_DRAFT_HEAD) {
-        const int64_t rank = hparams.dspark_markov_rank;
-        const int64_t size = rank + 2*n_embd + hparams.n_vocab_unpadded;
-        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, size);
-        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(inp->tokens);
-        inp->h = build_inp_embd_state(inp.get(), size);
-        const auto rows = [&](int64_t offset, int64_t width) {
-            return ggml_cont(ctx0, ggml_view_2d(ctx0, inp->h, width, n_tokens, inp->h->nb[1], offset*sizeof(float)));
-        };
-        auto * state = rows(0, rank);
-        auto * hidden = rows(rank, n_embd);
-        auto * context = rows(rank + n_embd, n_embd);
-        auto * base = rows(rank + 2*n_embd, hparams.n_vocab_unpadded);
-        res->t_logits = build_inkling2_head(*this, model, *llama_get_model(cparams.ctx_other), inp->tokens, state, hidden, base, context);
-        res->t_embd = res->t_h_nextn = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
-        cb(res->t_h_nextn, "dspark_chain_state", -1);
-        ggml_build_forward_expand(gf, res->t_h_nextn);
-        res->add_input(std::move(inp));
-        return;
-    }
-    auto * positions = build_inp_pos();
-    auto * attn = build_attn_inp_kv_iswa();
-    const int64_t rank = hparams.dspark_markov_rank;
-    const int64_t ntarget = model.target_layer_ids.size();
-    const auto mix = [&](ggml_tensor * features, int row, ggml_tensor * norm) {
-        auto * weights = ggml_soft_max(ctx0, ggml_view_1d(ctx0, model.dspark_fuse, ntarget, row*model.dspark_fuse->nb[1]));
-        auto * x = ggml_reshape_3d(ctx0, features, n_embd, ntarget, n_tokens);
-        x = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3));
-        x = ggml_sum_rows(ctx0, ggml_mul(ctx0, x, weights));
-        return build_norm(ggml_reshape_2d(ctx0, x, n_embd, n_tokens), norm, nullptr, LLM_NORM_RMS, row == n_layer ? -1 : row);
-    };
-
-    if (ubatch.embd || ubatch.embd_row) {
-        auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
-        auto * features = build_inp_target_features(*this, *inp, hparams.n_embd_inp_enc());
-        res->add_input(std::move(inp));
-        for (int il = 0; il < n_layer; ++il) {
-            const auto & l = model.layers[il];
-            const int64_t hd = hparams.n_embd_head_k(il);
-            const int64_t nk = hparams.n_head_kv(il);
-            auto * context = mix(features, il, l.dflare_norm);
-            cb(context, "dspark_context", il);
-            auto * k = ggml_reshape_3d(ctx0, build_lora_mm(l.attn_k_ctx, context), hd, nk, n_tokens);
-            auto * v = ggml_reshape_3d(ctx0, build_lora_mm(l.attn_v_ctx, context), hd, nk, n_tokens);
-            k = build_norm(k, l.attn_k_ctx_norm, nullptr, LLM_NORM_RMS, il);
-            k = build_rope(k, positions, il);
-            const bool swa = hparams.is_swa(il);
-            const auto * kv = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
-            auto * k_rot = swa ? attn->self_k_rot_swa[il] : attn->self_k_rot[il];
-            auto * v_rot = swa ? attn->self_v_rot_swa[il] : attn->self_v_rot[il];
-            if (k_rot) {
-                k = llama_mul_mat_hadamard(ctx0, k, k_rot);
-            }
-            if (v_rot) {
-                v = llama_mul_mat_hadamard(ctx0, v, v_rot);
-            }
-            ggml_build_forward_expand(gf, kv->cpy_k(ctx0, k, swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
-            ggml_build_forward_expand(gf, kv->cpy_v(ctx0, v, swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
-        }
-        res->t_embd = res->t_h_nextn = mix(features, n_layer, model.dspark_norm);
-        cb(res->t_h_nextn, "dspark_f_rnn", -1);
-        ggml_build_forward_expand(gf, res->t_h_nextn);
-        return;
-    }
-
-    GGML_ASSERT(cparams.ctx_other);
-    const auto * target = llama_get_model(cparams.ctx_other);
-    GGML_ASSERT(target->tok_embd && target->tok_norm && target->output);
-    ggml_tensor * tokens;
-    ggml_tensor * f_rnn = nullptr;
-    if (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
-        tokens = inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(tokens);
-        res->add_input(std::move(inp));
-    } else {
-        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
-        tokens = inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(tokens);
-        f_rnn = inp->h = build_inp_embd_state(inp.get(), n_embd);
-        res->add_input(std::move(inp));
-    }
-
-    const int64_t nb = ubatch.n_seqs_unq;
-    const int64_t block = n_tokens/nb;
-    auto * ids = ggml_cont_1d(ctx0, ggml_view_2d(ctx0, tokens, 1, nb, block*tokens->nb[0], 0), nb);
-    auto * anchors = ggml_get_rows(ctx0, target->tok_embd, ids);
-    anchors = ggml_mul(ctx0, ggml_rms_norm(ctx0, anchors, target->hparams.f_norm_rms_eps), target->tok_norm);
-    auto * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, nb);
-    if (block > 1) {
-        auto * masks = ggml_repeat_4d(ctx0, ggml_cast(ctx0, model.dspark_mask_embd, GGML_TYPE_F32), n_embd, block - 1, nb, 1);
-        cur = ggml_concat(ctx0, cur, masks, 1);
-    }
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
-    attn->self_attn_mask_swa.block_uniform = true;
-    for (int il = 0; il < n_layer; ++il) {
-        const auto & l = model.layers[il];
-        const int64_t hd = hparams.n_embd_head_k(il);
-        auto * residual = cur;
-        cur = build_norm(cur, l.attn_norm, nullptr, LLM_NORM_RMS, il);
-        auto * q = ggml_reshape_3d(ctx0, build_lora_mm(l.wq, cur), hd, hparams.n_head(il), n_tokens);
-        auto * k = ggml_reshape_3d(ctx0, build_lora_mm(l.wk, cur), hd, hparams.n_head_kv(il), n_tokens);
-        auto * v = ggml_reshape_3d(ctx0, build_lora_mm(l.wv, cur), hd, hparams.n_head_kv(il), n_tokens);
-        q = build_rope(build_norm(q, l.attn_q_norm, nullptr, LLM_NORM_RMS, il), positions, il);
-        k = build_rope(build_norm(k, l.attn_k_norm, nullptr, LLM_NORM_RMS, il), positions, il);
-        cur = build_attn(attn, l.wo, nullptr, nullptr, q, k, v, nullptr, nullptr, nullptr, 1.0f/sqrtf(hd), il);
-        residual = ggml_add(ctx0, residual, cur);
-        cur = build_norm(residual, l.ffn_norm, nullptr, LLM_NORM_RMS, il);
-        cur = build_ffn(cur, l.ffn_up, nullptr, nullptr, l.ffn_gate, nullptr, nullptr,
-                l.ffn_down, nullptr, nullptr, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cur = ggml_add(ctx0, residual, cur);
-        cb(cur, "dspark_layer", il);
-    }
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-    res->t_embd = cur;
-    auto * base = build_lora_mm(target->output, cur, target->output_s);
-    ggml_prec_set_acc(base, GGML_PREC_F32);
-    if (params.gtype == LLM_GRAPH_TYPE_DRAFT_BACKBONE || block > hparams.dflash_block_size) {
-        res->t_h_nextn = cur;
-        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
-        if (n_outputs < n_tokens) {
-            // AMB_DSPARK_TRIM (C3c): only some rows were asked for
-            if (ggml_tensor * out_ids = build_inp_out_ids()) {
-                res->t_logits = ggml_get_rows(ctx0, res->t_logits, out_ids);
-            }
-        }
-        return;
-    }
-    // AMB_DSPARK_TRIM=1 (C3c, default off): the drafter asks for the logits of block positions 1..m only (m = n_max),
-    // so the chain stops at m instead of block - 1. The chain is causal (step i reads steps < i only), so the steps it
-    // keeps are the same nodes on the same inputs. The logits come out in output order (per block, positions 1..m);
-    // the chain states keep one row per token (unmasked h_nextn), the positions past m are zero.
-    int64_t n_chain = block - 1;
-    bool    trim    = false;
-    {
-        static const bool trim_env = [] {
-            const char * v = getenv("AMB_DSPARK_TRIM");
-            const bool on = v != nullptr && strcmp(v, "1") == 0;
-            if (on) {
-                LLAMA_LOG_INFO("amb_dspark_trim: AMB_DSPARK_TRIM=1 active (the Inkling2 DSpark chain stops at the last requested position)\n");
-            }
-            return on;
-        }();
-        if (trim_env && ubatch.output && n_outputs < n_tokens && n_outputs > 0 && n_outputs % nb == 0) {
-            const int64_t m = n_outputs/nb;
-            bool ok = m >= 1 && m <= block - 1;
-            for (int64_t b = 0; ok && b < nb; ++b) {
-                for (int64_t i = 0; ok && i < block; ++i) {
-                    ok = (ubatch.output[b*block + i] != 0) == (i >= 1 && i <= m);
-                }
-            }
-            if (ok) {
-                n_chain = m;
-                trim    = true;
-            }
-        }
-    }
-    // AMB_DSPARK_IDS=1|2 (D1, default off; only with the trimmed chain): the first-maximum id the chain computes at each
-    // step (the token the host's greedy sampler takes from the same logits column) is written as id + 1 into element
-    // `rank` of the chain state row of that position (the first element of the zero padding, 0 = no id). The host
-    // reads the ids from the h_nextn rows it already receives. Mode 1 does not output the logits (no 3 x n_vocab
-    // readback, no host pass over the vocabulary); mode 2 keeps them so the host can compare (check mode).
-    // The chain itself is unchanged: step i + 1 reads `state` and `prev` as before.
-    static const int ids_env = [] {
-        const char * v = getenv("AMB_DSPARK_IDS");
-        const int mode = v != nullptr && (strcmp(v, "1") == 0 || strcmp(v, "2") == 0) ? atoi(v) : 0;
-        if (mode != 0) {
-            LLAMA_LOG_INFO("amb_dspark_ids: AMB_DSPARK_IDS=%d: the trimmed Inkling2 DSpark chain writes its draft ids into the "
-                "chain state rows%s\n", mode, mode == 1 ? ", the draft logits are not output" : " (check mode: logits kept)");
-        }
-        return mode;
-    }();
-    const int ids_mode = trim && rank < n_embd ? ids_env : 0;
-    auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
-    auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
-    auto * logits = trim ? nullptr : ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, block*base->nb[1], 0));
-    const auto column = [&](ggml_tensor * t, int64_t i) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
-    };
-    auto * context = column(f_rnn, 0);
-    auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
-    tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
-    auto * prev = ids;
-    for (int64_t i = 1; i <= n_chain; ++i) {
-        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
-        ggml_tensor * state_i = state; // the state after step i (step i + 1 keeps reading `state`)
-        if (ids_mode == 0) {
-            states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
-        }
-        logits = logits ? ggml_concat(ctx0, logits, col, 1) : col;
-        // Select the first maximum, independent of backend argmax tie order.
-        auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
-        auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
-        auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
-        prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
-        if (ids_mode != 0) {
-            // AMB_DSPARK_IDS: [state_i (rank) | id + 1 | zeros]. No integer cast: tie_rank[id] = n_vocab - id is gathered
-            // as F32 (ids are < 2^24, exact), so id + 1 = n_vocab + 1 - tie_rank[id]
-            auto * id_f = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, tie_rank, 1, tie_rank->ne[0]), prev); // [1, nb]
-            id_f = ggml_scale_bias(ctx0, id_f, -1.0f, (float) (hparams.n_vocab_unpadded + 1));
-            auto * row  = ggml_concat(ctx0, state_i, id_f, 0);
-            if (n_embd - rank - 1 > 0) {
-                row = ggml_pad(ctx0, row, n_embd - rank - 1, 0, 0, 0);
-            }
-            states = ggml_concat(ctx0, states, row, 1);
-        }
-    }
-    const auto block_order = [&](ggml_tensor * t, int64_t width) {
-        t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, width);
-        return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], nb*width);
-    };
-    if (trim && n_chain + 1 < block) {
-        // the positions past the chain: zero states (one row per token)
-        states = ggml_pad(ctx0, states, 0, nb*(block - 1 - n_chain), 0, 0);
-    }
-    res->t_h_nextn = block_order(states, block);
-    cb(res->t_h_nextn, "dspark_chain_state", -1);
-    ggml_build_forward_expand(gf, res->t_h_nextn);
-    // trimmed: positions 1..n_chain of each block, which is the output order of the requested rows
-    const int64_t width = trim ? n_chain : block;
-    if (ids_mode == 1) {
-        // AMB_DSPARK_IDS=1: the ids are in the chain state rows, no logits output (the columns stay inputs of the chain)
-        res->t_logits = nullptr;
-        return;
-    }
-    logits = block_order(logits, width);
-    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, nb*width, logits->nb[1], 0));
 }

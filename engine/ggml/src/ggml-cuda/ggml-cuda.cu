@@ -23,6 +23,7 @@
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
+#include "ggml-cuda/depth-mix.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diag.cuh"
@@ -42,8 +43,10 @@
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/amb-ink.cuh"
+#include "ggml-cuda/elem-fuse.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
+#include "ggml-cuda/fattn-rel.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
@@ -54,9 +57,11 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sleep.cuh"
 #include "ggml-cuda/snake.cuh"
+#include "ggml-cuda/clip-rows.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/conv-chain.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -65,6 +70,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
+#include "ggml-cuda/situ.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
@@ -89,6 +95,7 @@
 #include <chrono>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -1084,6 +1091,10 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    if (getenv("GGML_CUDA_Q8_1_REUSE_STATS")) {
+        GGML_LOG_INFO("%s: src1 q8_1 reuse: %lld hits, %lld quantizations\n", __func__,
+            (long long) src1_cache.n_hit, (long long) src1_cache.n_miss);
+    }
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2498,7 +2509,584 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+// AMB_H2D_ZC=1 (default off): host-to-device async copies on a backend's compute stream whose source is pinned,
+// device-mapped host memory are done by a copy kernel that reads the host memory directly (zero-copy) instead of
+// cudaMemcpyAsync / cudaMemcpyBatchAsync. On WDDM every DMA H2D on a stream costs ~65 us of fixed latency before the
+// next kernel can start; the kernel has no fixed cost. Same bytes, same stream, same order: the outputs are identical.
+// Not used for: backends that never ran a graph (the private upload/miss backends whose copies overlap compute on
+// their own stream), streams under graph capture, sources that are not pinned and mapped (pageable memory), D2H and
+// synchronous copies. AMB_H2D_ZC_CHECK=1 (debug) also does the DMA copy into a scratch buffer after each zero-copy,
+// compares on the device and aborts on a mismatch (synchronizes the stream every copy).
+//
+// ggml_backend_cuda_memcpy_batch_async is also called for D2H readbacks: a call is taken only when it is H2D, i.e.
+// no destination lies in a registered pinned host range and no source is device or managed memory; any other call
+// goes to the DMA path untouched (counted as skipped_not_h2d). A destination is not otherwise verified to be device
+// memory: the function is documented for host-to-device and device-to-host copies only, and a pageable or
+// unregistered host destination of a D2H copy is caught by its device source.
+//
+// Contract: the destinations of one batch must be disjoint (the threads of the kernel write in no defined order
+// across copies, and cudaMemcpyBatchAsync gives no order between overlapping copies either); AMB_H2D_ZC_CHECK aborts
+// on overlapping destinations. The sources must stay unmodified until the copy has executed on the stream, as for
+// the DMA path (srcAccessOrder Stream). AMB_H2D_ZC_CHECK synchronizes after every copy, so it serialises the host and
+// the stream: it verifies the bytes the kernel wrote but cannot catch a race where the host rewrites a source after
+// the call and before the copy executes.
+//
+// AMB_H2D_ZC_MAX=<bytes> (default 0 = unlimited): a call with more bytes in total keeps the DMA path (too_big).
+// AMB_H2D_ZC_STATS=<n> (default 0): also print a backend's stats line every n calls (the counts since its previous
+// line), since a killed server never reaches the line at backend free.
+// A kernel launch error, or an error already pending before the launch (left in place), falls back to the DMA call.
+// CUDA only: compiled out for HIP and MUSA, where the switch has no effect (one warning when it is set).
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define AMB_ZC_SUPPORTED
+#endif
+
+#ifdef AMB_ZC_SUPPORTED
+static bool amb_zc_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("AMB_H2D_ZC");
+    return enabled;
+}
+
+static bool amb_zc_check_enabled() {
+    static const bool enabled = amb_zc_enabled() && ggml_cuda_env_flag("AMB_H2D_ZC_CHECK");
+    return enabled;
+}
+
+static uint64_t amb_zc_env_u64(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr ? (uint64_t) strtoull(env, nullptr, 10) : (uint64_t) 0;
+}
+
+static uint64_t amb_zc_max_bytes() {
+    static const uint64_t n = amb_zc_env_u64("AMB_H2D_ZC_MAX");
+    return n;
+}
+
+// AMB_H2D_ZC_DELAY_US=<n> (debug, default 0): every block of the copy kernel spins n microseconds on %globaltimer
+// before it reads any source byte, so a caller that rewrites a host source before the stream reached the copy
+// shows up as changed output (negative control of the "sources stay unmodified until executed" contract)
+static uint64_t amb_zc_delay_ns() {
+    static const uint64_t n = amb_zc_env_u64("AMB_H2D_ZC_DELAY_US")*1000;
+    return n;
+}
+
+// AMB_H2D_ZC_FAULT=1 (debug, default off, meaningful with AMB_H2D_ZC_DELAY_US): right after a zero-copy launch the
+// host overwrites with 0xA5 every source of the call that is smaller than AMB_ZC_FAULT_MAX bytes and lies in memory
+// allocated by ggml_cuda_host_malloc (the pinned host buffers: the MoE cache staging buffers ia.stage, hf_stage,
+// mo2_stage, and pinned graph inputs), simulating a missing wait. Output is deliberately corrupted.
+#define AMB_ZC_FAULT_MAX (64*1024)
+static bool amb_zc_fault_enabled() {
+    static const bool enabled = amb_zc_enabled() && ggml_cuda_env_flag("AMB_H2D_ZC_FAULT");
+    return enabled;
+}
+
+static uint64_t amb_zc_stats_every() {
+    static const uint64_t n = amb_zc_env_u64("AMB_H2D_ZC_STATS");
+    return n;
+}
+
+struct amb_zc_range {
+    uintptr_t base;
+    size_t    size;
+    uintptr_t dev;
+    bool      host_alloc; // allocated by ggml_cuda_host_malloc (writable; AMB_H2D_ZC_FAULT targets only these)
+};
+
+// the registry of pinned ranges is process-wide (pinned memory is); the counters are per backend context
+// (ggml_backend_cuda_context::amb_zc_stats), so the draft and target contexts do not reset each other's counts
+struct amb_zc_state {
+    std::mutex mtx;
+    std::vector<amb_zc_range>     ranges; // pinned allocations made by this backend (cudaMallocHost, cudaHostRegister)
+    std::unordered_set<uintptr_t> neg;    // source pointers found not pinned+mapped (a stale entry only costs a DMA copy)
+    std::unordered_set<uintptr_t> dev;    // source pointers found device/managed memory (a stale entry only costs a DMA copy)
+    std::atomic<bool>     announced{false};
+    std::atomic<bool>     warned_launch{false};
+};
+
+static amb_zc_state & amb_zc() {
+    static amb_zc_state st;
+    return st;
+}
+
+// called after a successful cudaMallocHost / cudaHostRegister (switch on only); the device pointer of the base is
+// taken once here, so the hot path is a range lookup instead of a cudaPointerGetAttributes per copy
+static void amb_zc_add_range(void * ptr, size_t size, bool host_alloc) {
+    if (!amb_zc_enabled() || ptr == nullptr || size == 0) {
+        return;
+    }
+    void * dev = nullptr;
+    if (cudaHostGetDevicePointer(&dev, ptr, 0) != cudaSuccess || dev == nullptr) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: AMB_H2D_ZC: %.2f MiB of pinned memory has no device pointer; copies from it stay DMA\n",
+            __func__, size/1024.0/1024.0);
+        return;
+    }
+    amb_zc_state & st = amb_zc();
+    std::lock_guard<std::mutex> lock(st.mtx);
+    st.ranges.push_back({(uintptr_t) ptr, size, (uintptr_t) dev, host_alloc});
+    st.neg.clear();
+    st.dev.clear();
+}
+
+// called before cudaFreeHost / cudaHostUnregister of an allocation (switch on only)
+static void amb_zc_remove_range(void * ptr) {
+    if (!amb_zc_enabled() || ptr == nullptr) {
+        return;
+    }
+    amb_zc_state & st = amb_zc();
+    std::lock_guard<std::mutex> lock(st.mtx);
+    for (size_t i = 0; i < st.ranges.size(); ++i) {
+        if (st.ranges[i].base == (uintptr_t) ptr) {
+            st.ranges.erase(st.ranges.begin() + i);
+            break;
+        }
+    }
+    st.neg.clear();
+    st.dev.clear();
+}
+
+enum amb_zc_src_kind {
+    AMB_ZC_SRC_MAPPED,     // pinned, mapped, [src, src + size) inside one allocation
+    AMB_ZC_SRC_NOT_PINNED, // pageable, unknown, or not wholly inside one pinned allocation
+    AMB_ZC_SRC_DEVICE,     // device or managed memory: the call is not H2D
+};
+
+// runtime query for a source outside the registry; the whole [src, src + size) must lie inside one pinned, mapped
+// allocation (accepting on the start address alone could read past the allocation)
+static amb_zc_src_kind amb_zc_query(const void * src, size_t size, const void ** dev_out) {
+    cudaPointerAttributes attr = {};
+    if (cudaPointerGetAttributes(&attr, src) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return AMB_ZC_SRC_NOT_PINNED;
+    }
+    if (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged) {
+        return AMB_ZC_SRC_DEVICE;
+    }
+    if (attr.type != cudaMemoryTypeHost || attr.devicePointer == nullptr) {
+        return AMB_ZC_SRC_NOT_PINNED;
+    }
+#if !defined(GGML_CUDA_NO_VMM)
+    // the driver API is linked (VMM): the allocation's own range
+    CUdeviceptr start = 0;
+    size_t      range = 0;
+    if (cuPointerGetAttribute(&start, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr) (uintptr_t) src) != CUDA_SUCCESS ||
+        cuPointerGetAttribute(&range, CU_POINTER_ATTRIBUTE_RANGE_SIZE,       (CUdeviceptr) (uintptr_t) src) != CUDA_SUCCESS) {
+        return AMB_ZC_SRC_NOT_PINNED;
+    }
+    if ((uintptr_t) src < (uintptr_t) start || (uintptr_t) src + size > (uintptr_t) start + range) {
+        return AMB_ZC_SRC_NOT_PINNED;
+    }
+#else
+    // runtime API only: the last byte must be pinned host memory mapped at the same offset
+    if (size > 1) {
+        cudaPointerAttributes last = {};
+        if (cudaPointerGetAttributes(&last, (const char *) src + (size - 1)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return AMB_ZC_SRC_NOT_PINNED;
+        }
+        if (last.type != cudaMemoryTypeHost ||
+            (const char *) last.devicePointer != (const char *) attr.devicePointer + (size - 1)) {
+            return AMB_ZC_SRC_NOT_PINNED;
+        }
+    }
+#endif // !defined(GGML_CUDA_NO_VMM)
+    *dev_out = attr.devicePointer;
+    return AMB_ZC_SRC_MAPPED;
+}
+
+enum amb_zc_batch_kind {
+    AMB_ZC_BATCH_OK,         // every non-empty source resolved (dev_srcs filled)
+    AMB_ZC_BATCH_NOT_PINNED, // H2D, but some source is not pinned and mapped
+    AMB_ZC_BATCH_NOT_H2D,    // a destination is pinned host memory or a source is device memory
+};
+
+// classifies a call. The not-pinned cache is written only for a call that is H2D.
+static amb_zc_batch_kind amb_zc_resolve_batch(void * const * dsts, const void * const * srcs, const size_t * sizes, size_t count,
+                                              std::vector<const void *> & dev_srcs) {
+    amb_zc_state & st = amb_zc();
+    static thread_local std::vector<size_t>    pending;
+    static thread_local std::vector<uintptr_t> new_neg;
+    pending.clear();
+    new_neg.clear();
+    dev_srcs.assign(count, nullptr);
+    bool not_pinned = false;
+    {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        for (size_t k = 0; k < count; ++k) {
+            if (sizes[k] == 0) {
+                dev_srcs[k] = srcs[k];
+                continue;
+            }
+            const uintptr_t d = (uintptr_t) dsts[k];
+            const uintptr_t p = (uintptr_t) srcs[k];
+            bool found = false;
+            for (const amb_zc_range & r : st.ranges) {
+                if (d >= r.base && d < r.base + r.size) {
+                    return AMB_ZC_BATCH_NOT_H2D; // destination in pinned host memory: a readback
+                }
+                if (!found && p >= r.base && p + sizes[k] <= r.base + r.size) {
+                    dev_srcs[k] = (const void *) (r.dev + (p - r.base));
+                    found = true;
+                }
+            }
+            if (found) {
+                continue;
+            }
+            if (st.dev.count(p) != 0) {
+                return AMB_ZC_BATCH_NOT_H2D;
+            }
+            if (st.neg.count(p) != 0) {
+                not_pinned = true; // keep going: a later copy may show the call is not H2D
+                continue;
+            }
+            pending.push_back(k);
+        }
+    }
+    // pinned memory not allocated through this backend (or not yet seen): ask the runtime, not cached when positive
+    for (size_t k : pending) {
+        const void * dev = nullptr;
+        const amb_zc_src_kind kind = amb_zc_query(srcs[k], sizes[k], &dev);
+        if (kind == AMB_ZC_SRC_MAPPED) {
+            dev_srcs[k] = dev;
+        } else if (kind == AMB_ZC_SRC_DEVICE) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            if (st.dev.size() > 65536) {
+                st.dev.clear();
+            }
+            st.dev.insert((uintptr_t) srcs[k]);
+            return AMB_ZC_BATCH_NOT_H2D;
+        } else {
+            new_neg.push_back((uintptr_t) srcs[k]);
+            not_pinned = true;
+        }
+    }
+    if (!new_neg.empty()) {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        if (st.neg.size() > 65536) {
+            st.neg.clear();
+        }
+        st.neg.insert(new_neg.begin(), new_neg.end());
+    }
+    return not_pinned ? AMB_ZC_BATCH_NOT_PINNED : AMB_ZC_BATCH_OK;
+}
+
+#define AMB_ZC_MAX_COPIES 64
+
+struct amb_zc_desc {
+    char       * dst;
+    const char * src; // device-accessible address of the pinned host source
+    size_t       size;
+};
+
+struct amb_zc_batch {
+    int         n;
+    amb_zc_desc d[AMB_ZC_MAX_COPIES];
+};
+
+// every thread of the grid takes part in every copy (grid-stride), copies in order; 16-byte loads when source,
+// destination and size are 16-aligned, else 4-byte or byte loads for that copy
+template <bool delay>
+static __global__ void amb_zc_copy_kernel(const amb_zc_batch b, const uint64_t delay_ns) {
+    if constexpr (delay) {
+        // AMB_H2D_ZC_DELAY_US: no source byte is read before the delay has passed in this block
+        if (threadIdx.x == 0) {
+            uint64_t t0, t;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+            do {
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            } while (t - t0 < delay_ns);
+        }
+        __syncthreads();
+    } else {
+        GGML_UNUSED(delay_ns);
+    }
+    const size_t tid = (size_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const size_t nth = (size_t) gridDim.x*blockDim.x;
+    for (int k = 0; k < b.n; ++k) {
+        char       * d = b.d[k].dst;
+        const char * s = b.d[k].src;
+        const size_t n = b.d[k].size;
+        const uintptr_t al = (uintptr_t) d | (uintptr_t) s | (uintptr_t) n;
+        if ((al & 15) == 0) {
+            const int4 * s4 = (const int4 *) s;
+            int4       * d4 = (int4 *) d;
+            for (size_t i = tid; i < n/16; i += nth) {
+                d4[i] = s4[i];
+            }
+        } else if ((al & 3) == 0) {
+            const int * s1 = (const int *) s;
+            int       * d1 = (int *) d;
+            for (size_t i = tid; i < n/4; i += nth) {
+                d1[i] = s1[i];
+            }
+        } else {
+            for (size_t i = tid; i < n; i += nth) {
+                d[i] = s[i];
+            }
+        }
+    }
+}
+
+static __global__ void amb_zc_cmp_kernel(const char * a, const char * b, size_t n, int * flag) {
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
+        if (a[i] != b[i]) {
+            *flag = 1;
+        }
+    }
+}
+
+// true (and counted) if the stream is under graph capture or its capture state cannot be read: the call keeps DMA
+static bool amb_zc_stream_capturing(ggml_backend_cuda_context * ctx, cudaStream_t stream) {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess) {
+        (void) cudaGetLastError();
+        ctx->amb_zc_stats.fb_capturing++;
+        return true;
+    }
+    if (cs != cudaStreamCaptureStatusNone) {
+        ctx->amb_zc_stats.fb_capturing++;
+        return true;
+    }
+    return false;
+}
+
+// AMB_H2D_ZC_CHECK: the destinations of one call must not overlap
+static void amb_zc_check_disjoint(void * const * dsts, const size_t * sizes, size_t count) {
+    std::vector<std::pair<uintptr_t, size_t>> r;
+    r.reserve(count);
+    for (size_t k = 0; k < count; ++k) {
+        if (sizes[k] > 0) {
+            r.emplace_back((uintptr_t) dsts[k], sizes[k]);
+        }
+    }
+    std::sort(r.begin(), r.end());
+    for (size_t k = 1; k < r.size(); ++k) {
+        if (r[k - 1].first + r[k - 1].second > r[k].first) {
+            GGML_ABORT("AMB_H2D_ZC_CHECK: destinations of one copy batch overlap: [%p, +%zu) and [%p, +%zu)",
+                (void *) r[k - 1].first, r[k - 1].second, (void *) r[k].first, r[k].second);
+        }
+    }
+}
+
+// AMB_H2D_ZC_CHECK: DMA the same bytes into a scratch buffer and compare with what the kernel wrote
+static void amb_zc_check(ggml_backend_cuda_context * ctx, cudaStream_t stream, void * dst, const void * host_src, size_t size) {
+    if (ctx->amb_zc_scratch_len < size) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (ctx->amb_zc_scratch != nullptr) {
+            CUDA_CHECK(cudaFree(ctx->amb_zc_scratch));
+        }
+        CUDA_CHECK(cudaMalloc(&ctx->amb_zc_scratch, size));
+        ctx->amb_zc_scratch_len = size;
+    }
+    if (ctx->amb_zc_flag == nullptr) {
+        CUDA_CHECK(cudaMalloc((void **) &ctx->amb_zc_flag, sizeof(int)));
+    }
+    CUDA_CHECK(cudaMemsetAsync(ctx->amb_zc_flag, 0, sizeof(int), stream));
+    CUDA_CHECK(cudaMemcpyAsync(ctx->amb_zc_scratch, host_src, size, cudaMemcpyHostToDevice, stream));
+    const int blocks = (int) std::min<size_t>(160, std::max<size_t>(1, (size + 255)/256));
+    amb_zc_cmp_kernel<<<blocks, 256, 0, stream>>>((const char *) dst, (const char *) ctx->amb_zc_scratch, size, ctx->amb_zc_flag);
+    CUDA_CHECK(cudaGetLastError());
+    int h = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h, ctx->amb_zc_flag, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (h != 0) {
+        GGML_ABORT("AMB_H2D_ZC_CHECK: zero-copy H2D of %zu bytes (dst %p, src %p) differs from the DMA copy", size, dst, host_src);
+    }
+    ctx->amb_zc_stats.checked++;
+}
+
+// AMB_H2D_ZC_FAULT: overwrite the small host-allocated pinned sources of a call that was just launched
+static void amb_zc_fault(const void * const * srcs, const size_t * sizes, size_t count) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+        GGML_LOG_WARN("AMB_H2D_ZC_FAULT=1: zero-copy sources below %d bytes in pinned host buffers are overwritten with 0xA5 after "
+            "each launch (delay %llu us): OUTPUT IS DELIBERATELY CORRUPTED (debug negative control)\n",
+            AMB_ZC_FAULT_MAX, (unsigned long long) (amb_zc_delay_ns()/1000));
+    }
+    amb_zc_state & st = amb_zc();
+    std::lock_guard<std::mutex> lock(st.mtx);
+    for (size_t k = 0; k < count; ++k) {
+        if (sizes[k] == 0 || sizes[k] >= AMB_ZC_FAULT_MAX) {
+            continue;
+        }
+        const uintptr_t p = (uintptr_t) srcs[k];
+        for (const amb_zc_range & r : st.ranges) {
+            if (r.host_alloc && p >= r.base && p + sizes[k] <= r.base + r.size) {
+                memset((void *) srcs[k], 0xA5, sizes[k]);
+                break;
+            }
+        }
+    }
+}
+
+// one line with a backend's counts since its previous line (nothing printed when the switch is off or idle)
+static void amb_zc_report(ggml_backend_cuda_context * ctx, const char * when) {
+    if (!amb_zc_enabled()) {
+        return;
+    }
+    ggml_cuda_amb_zc_stats & s = ctx->amb_zc_stats;
+    const uint64_t calls  = s.calls.exchange(0), copies = s.copies.exchange(0), bytes = s.bytes.exchange(0);
+    const uint64_t narrow = s.narrow.exchange(0), checked = s.checked.exchange(0);
+    const uint64_t fnp = s.fb_not_pinned.exchange(0), fcap = s.fb_capturing.exchange(0), fnc = s.fb_not_compute.exchange(0);
+    const uint64_t ftb = s.fb_too_big.exchange(0), fpe = s.fb_pending_err.exchange(0), fle = s.fb_launch_err.exchange(0);
+    const uint64_t skp = s.skipped_not_h2d.exchange(0);
+    if (calls + fnp + fcap + fnc + ftb + fpe + fle + skp == 0) {
+        return;
+    }
+    GGML_LOG_INFO("amb_h2d_zc: %s: ctx = %p, dev = %d, zc_calls = %llu, copies = %llu, MiB = %.2f, not_16_aligned = %llu, "
+        "fallbacks: not_pinned = %llu, capturing = %llu, not_compute_stream = %llu, too_big = %llu, pending_err = %llu, "
+        "launch_err = %llu, skipped_not_h2d = %llu, checked = %llu\n",
+        when, (const void *) ctx, ctx->device,
+        (unsigned long long) calls, (unsigned long long) copies, bytes/1024.0/1024.0, (unsigned long long) narrow,
+        (unsigned long long) fnp, (unsigned long long) fcap, (unsigned long long) fnc, (unsigned long long) ftb,
+        (unsigned long long) fpe, (unsigned long long) fle, (unsigned long long) skp, (unsigned long long) checked);
+}
+
+// performs the count copies (host srcs -> device dsts) on the compute stream by copy kernels; false if the call does
+// not qualify or a launch failed, then the caller issues its DMA call unchanged (re-doing any copy already issued,
+// which writes the same bytes in stream order)
+static bool amb_zc_copy_impl(ggml_backend_cuda_context * ctx, void * const * dsts, const void * const * srcs, const size_t * sizes, size_t count) {
+    ggml_cuda_amb_zc_stats & cs = ctx->amb_zc_stats;
+    if (!ctx->amb_zc_compute.load(std::memory_order_relaxed)) {
+        cs.fb_not_compute++;
+        return false;
+    }
+    static thread_local std::vector<const void *> dev_srcs;
+    const amb_zc_batch_kind bk = amb_zc_resolve_batch(dsts, srcs, sizes, count, dev_srcs);
+    if (bk == AMB_ZC_BATCH_NOT_H2D) {
+        cs.skipped_not_h2d++;
+        return false;
+    }
+    if (bk == AMB_ZC_BATCH_NOT_PINNED) {
+        cs.fb_not_pinned++;
+        return false;
+    }
+    size_t total = 0;
+    for (size_t k = 0; k < count; ++k) {
+        total += sizes[k];
+    }
+    const uint64_t max_bytes = amb_zc_max_bytes();
+    if (max_bytes > 0 && total > max_bytes) {
+        cs.fb_too_big++;
+        return false;
+    }
+    cudaStream_t stream = ctx->stream();
+    if (amb_zc_stream_capturing(ctx, stream)) {
+        return false;
+    }
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        // an error of earlier work is pending: leave it to its owner and keep the old path
+        cs.fb_pending_err++;
+        return false;
+    }
+    if (amb_zc_check_enabled()) {
+        amb_zc_check_disjoint(dsts, sizes, count);
+    }
+    amb_zc_state & st = amb_zc();
+    if (!st.announced.exchange(true)) {
+        GGML_LOG_INFO("AMB_H2D_ZC=1: compute-stream H2D from pinned host memory by copy kernel%s\n",
+            amb_zc_check_enabled() ? " (AMB_H2D_ZC_CHECK=1: each copy verified against a DMA copy)" : "");
+    }
+    amb_zc_batch b;
+    uint64_t narrow = 0;
+    for (size_t k0 = 0; k0 < count; k0 += AMB_ZC_MAX_COPIES) {
+        const size_t nk = std::min<size_t>(AMB_ZC_MAX_COPIES, count - k0);
+        b.n = 0;
+        size_t max_size = 0;
+        for (size_t k = k0; k < k0 + nk; ++k) {
+            if (sizes[k] == 0) {
+                continue;
+            }
+            b.d[b.n++] = {(char *) dsts[k], (const char *) dev_srcs[k], sizes[k]};
+            max_size = std::max(max_size, sizes[k]);
+            if ((((uintptr_t) dsts[k]) | ((uintptr_t) dev_srcs[k]) | sizes[k]) & 15) {
+                narrow++;
+            }
+        }
+        if (b.n == 0) {
+            continue;
+        }
+        const int blocks = (int) std::min<size_t>(160, std::max<size_t>(1, (max_size + 16*256 - 1)/(16*256)));
+        const uint64_t delay_ns = amb_zc_delay_ns();
+        if (delay_ns == 0) {
+            amb_zc_copy_kernel<false><<<blocks, 256, 0, stream>>>(b, 0);
+        } else {
+            amb_zc_copy_kernel<true><<<blocks, 256, 0, stream>>>(b, delay_ns);
+        }
+        const cudaError_t le = cudaGetLastError(); // no error was pending, so this is the launch's own
+        if (le != cudaSuccess) {
+            cs.fb_launch_err++;
+            if (!st.warned_launch.exchange(true)) {
+                GGML_LOG_WARN("%s: AMB_H2D_ZC: copy kernel launch failed (%s); the call takes the DMA path\n",
+                    __func__, cudaGetErrorString(le));
+            }
+            return false;
+        }
+    }
+    if (amb_zc_fault_enabled()) {
+        amb_zc_fault(srcs, sizes, count);
+    }
+    cs.calls++;
+    cs.copies += count;
+    cs.bytes  += total;
+    cs.narrow += narrow;
+    if (amb_zc_check_enabled()) {
+        for (size_t k = 0; k < count; ++k) {
+            if (sizes[k] > 0) {
+                amb_zc_check(ctx, stream, dsts[k], srcs[k], sizes[k]);
+            }
+        }
+    }
+    return true;
+}
+
+static bool amb_zc_copy(ggml_backend_cuda_context * ctx, void * const * dsts, const void * const * srcs, const size_t * sizes, size_t count) {
+    const bool done = amb_zc_copy_impl(ctx, dsts, srcs, sizes, count);
+    const uint64_t every = amb_zc_stats_every();
+    if (every > 0 && (ctx->amb_zc_stats.attempts.fetch_add(1, std::memory_order_relaxed) + 1) % every == 0) {
+        amb_zc_report(ctx, "periodic");
+    }
+    return done;
+}
+#else
+// HIP / MUSA: no zero-copy path (the runtime calls it needs have no mapping in vendors/hip.h and musa.h)
+static bool amb_zc_enabled() {
+    static const bool warned = [] {
+        if (ggml_cuda_env_flag("AMB_H2D_ZC")) {
+            GGML_LOG_WARN("AMB_H2D_ZC is supported on CUDA only; ignored on this backend\n");
+        }
+        return true;
+    }();
+    GGML_UNUSED(warned);
+    return false;
+}
+
+static void amb_zc_add_range(void * ptr, size_t size, bool host_alloc) {
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(host_alloc);
+}
+
+static void amb_zc_remove_range(void * ptr) {
+    GGML_UNUSED(ptr);
+}
+
+static bool amb_zc_copy(ggml_backend_cuda_context * ctx, void * const * dsts, const void * const * srcs, const size_t * sizes, size_t count) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dsts);
+    GGML_UNUSED(srcs);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(count);
+    return false;
+}
+
+static void amb_zc_report(ggml_backend_cuda_context * ctx, const char * when) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(when);
+}
+#endif // AMB_ZC_SUPPORTED
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    amb_zc_remove_range(buffer->context);
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -2516,6 +3104,8 @@ static void * ggml_cuda_host_malloc(size_t size) {
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return nullptr;
     }
+
+    amb_zc_add_range(ptr, size, true); // AMB_H2D_ZC: no-op when off
 
     return ptr;
 }
@@ -4512,10 +5102,27 @@ static void amb_ot_report_cumulative() {
     }
 }
 
+#ifdef USE_CUDA_GRAPH
+static bool amb_gd_enabled();
+static void amb_gd_report_ctx(ggml_backend_cuda_context * cuda_ctx, const char * when, bool erase);
+#endif // USE_CUDA_GRAPH
+
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     amb_ot_report_cumulative();
+    amb_zc_report(cuda_ctx, "at backend free");
+#ifdef USE_CUDA_GRAPH
+    if (amb_gd_enabled()) {
+        amb_gd_report_ctx(cuda_ctx, "at backend free", true);
+    }
+#endif // USE_CUDA_GRAPH
+    if (cuda_ctx->amb_zc_scratch != nullptr || cuda_ctx->amb_zc_flag != nullptr) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(cuda_ctx->amb_zc_scratch));
+        CUDA_CHECK(cudaFree(cuda_ctx->amb_zc_flag));
+    }
 
     delete cuda_ctx;
     delete backend;
@@ -4532,6 +5139,11 @@ bool ggml_backend_cuda_memcpy_batch_async(ggml_backend_t backend, void ** dsts, 
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
+    // AMB_H2D_ZC: one kernel launch (per 64 copies) instead of the DMA batch when the call is H2D (no pinned host
+    // destination, no device source; readbacks keep the DMA batch untouched) and all sources are pinned and mapped
+    if (amb_zc_enabled() && amb_zc_copy(cuda_ctx, dsts, srcs, sizes, count)) {
+        return true;
+    }
     cudaMemcpyAttributes attr = {};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     size_t attr_idx = 0;
@@ -4704,7 +5316,11 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     const bool qt = amb_ot_copy_begin(cuda_ctx);
     const auto qt0 = qt ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    void * dst = (char *) tensor->data + offset;
+    // AMB_H2D_ZC: by the copy kernel when the stream and the source qualify, else the DMA copy as before
+    if (!(amb_zc_enabled() && size > 0 && amb_zc_copy(cuda_ctx, &dst, &data, &size, 1))) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    }
     if (qt) {
         amb_ot_copy_end(cuda_ctx, "H2D copy", size, qt0);
     }
@@ -4887,6 +5503,288 @@ static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return key;
 }
 
+// AMB_GRAPH_DIFF_LOG=1 (default off, diagnostic): why a cached CUDA graph entry is re-captured. When the property
+// check of an existing entry (same graph key, node_props already filled) finds a difference, one line names the
+// graph, the first differing node and its differing fields; executable updates and instantiations are counted per
+// key, and a summary per backend is printed at backend free (and every AMB_GRAPH_DIFF_SUMMARY property checks of a
+// backend, default 0 = only at free, since a killed server never frees its backends).
+// Lines (changed + instantiate together): the first 400, then every 100th.
+static bool amb_gd_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("AMB_GRAPH_DIFF_LOG");
+    return enabled;
+}
+
+static uint64_t amb_gd_summary_every() {
+    static const uint64_t n = [] {
+        const char * env = getenv("AMB_GRAPH_DIFF_SUMMARY");
+        return env != nullptr ? (uint64_t) strtoull(env, nullptr, 10) : (uint64_t) 0;
+    }();
+    return n;
+}
+
+struct amb_gd_key_stats {
+    uint64_t checks      = 0; // property checks (not counting uid reuse)
+    uint64_t req_true    = 0; // checks that returned true (new entry, node count change or property change)
+    uint64_t changed     = 0; // of those: on an existing entry
+    uint64_t inst_new    = 0; // cudaGraphInstantiate for a chunk index without an instance
+    uint64_t inst_fail   = 0; // cudaGraphInstantiate after cudaGraphExecUpdate failed
+    uint64_t inst_clust  = 0; // cudaGraphInstantiate after a cluster-dims change
+    uint64_t exec_upd_ok = 0; // successful cudaGraphExecUpdate
+    uint32_t field_mask  = 0; // union of the differing fields over all differing nodes
+    int      n_nodes     = 0;
+    char     first_name[GGML_MAX_NAME] = {};
+};
+
+struct amb_gd_state {
+    std::mutex mtx;
+    std::map<std::pair<const void *, uint64_t>, amb_gd_key_stats> keys; // (backend context, graph key)
+    std::unordered_map<const void *, uint64_t> checks_per_ctx;
+    std::atomic<uint64_t> occurrences{0};
+};
+
+static amb_gd_state & amb_gd() {
+    static amb_gd_state st;
+    return st;
+}
+
+static bool amb_gd_take_line() {
+    const uint64_t n = amb_gd().occurrences.fetch_add(1, std::memory_order_relaxed);
+    return n < 400 || (n - 400) % 100 == 99;
+}
+
+enum amb_gd_field : uint32_t {
+    AMB_GD_NE        = 1u << 0,
+    AMB_GD_NB        = 1u << 1,
+    AMB_GD_DATA      = 1u << 2,
+    AMB_GD_OP_PARAMS = 1u << 3,
+    AMB_GD_VIEW_SRC  = 1u << 4,
+    AMB_GD_VIEW_OFFS = 1u << 5,
+    AMB_GD_SRC_DATA  = 1u << 6,
+    AMB_GD_SRC_NE    = 1u << 7,
+    AMB_GD_SRC_NB    = 1u << 8,
+    AMB_GD_SRC_TPTR  = 1u << 9,  // node->src[j] tensor pointer
+    AMB_GD_TYPE      = 1u << 10,
+    AMB_GD_OP        = 1u << 11,
+    AMB_GD_FLAGS     = 1u << 12,
+    AMB_GD_BUFFER    = 1u << 13,
+    AMB_GD_NAME      = 1u << 14,
+    AMB_GD_EXTRA     = 1u << 15,
+    AMB_GD_PADDING   = 1u << 16,
+    AMB_GD_UNKNOWN   = 1u << 17, // memcmp differs but no named field does (should not happen)
+};
+
+static void amb_gd_mask_str(uint32_t m, char * buf, size_t len) {
+    static const char * names[] = { "ne", "nb", "data", "op_params", "view_src", "view_offs", "src_data", "src_ne",
+        "src_nb", "src_tensor_ptr", "type", "op", "flags", "buffer", "name", "extra", "padding", "unknown" };
+    size_t o = 0;
+    buf[0] = '\0';
+    for (int b = 0; b < (int) (sizeof(names)/sizeof(names[0])); ++b) {
+        if ((m & (1u << b)) && o + 1 < len) {
+            const int w = snprintf(buf + o, len - o, "%s%s", o ? "," : "", names[b]);
+            o = w > 0 ? std::min(len - 1, o + (size_t) w) : o;
+        }
+    }
+    if (o == 0) {
+        snprintf(buf, len, "-");
+    }
+}
+
+// appends to a bounded buffer
+static void amb_gd_add(char * buf, size_t len, size_t & o, const char * fmt, ...) {
+    if (o + 1 >= len) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    const int w = vsnprintf(buf + o, len - o, fmt, args);
+    va_end(args);
+    o = w > 0 ? std::min(len - 1, o + (size_t) w) : o;
+}
+
+// classifies the difference of saved (a) vs new (b) properties of one node; with detail != nullptr also writes the
+// values of the differing ne / data / view_offs, the first differing op_params int and the first differing src
+static uint32_t amb_gd_classify(const ggml_cuda_graph::node_properties & a, const ggml_cuda_graph::node_properties & b,
+                                const ggml_tensor * node, char * detail, size_t detail_len) {
+    const ggml_tensor & x = a.node;
+    const ggml_tensor & y = b.node;
+    uint32_t m = 0;
+    if (memcmp(x.ne, y.ne, sizeof(x.ne)) != 0)                       m |= AMB_GD_NE;
+    if (memcmp(x.nb, y.nb, sizeof(x.nb)) != 0)                       m |= AMB_GD_NB;
+    if (x.data != y.data)                                            m |= AMB_GD_DATA;
+    if (memcmp(x.op_params, y.op_params, sizeof(x.op_params)) != 0) m |= AMB_GD_OP_PARAMS;
+    if (x.view_src != y.view_src)                                    m |= AMB_GD_VIEW_SRC;
+    if (x.view_offs != y.view_offs)                                  m |= AMB_GD_VIEW_OFFS;
+    if (memcmp(a.node_src_data_ptrs, b.node_src_data_ptrs, sizeof(a.node_src_data_ptrs)) != 0) m |= AMB_GD_SRC_DATA;
+    if (memcmp(a.node_src_ne, b.node_src_ne, sizeof(a.node_src_ne)) != 0) m |= AMB_GD_SRC_NE;
+    if (memcmp(a.node_src_nb, b.node_src_nb, sizeof(a.node_src_nb)) != 0) m |= AMB_GD_SRC_NB;
+    if (memcmp(x.src, y.src, sizeof(x.src)) != 0)                    m |= AMB_GD_SRC_TPTR;
+    if (x.type != y.type)                                            m |= AMB_GD_TYPE;
+    if (x.op != y.op)                                                m |= AMB_GD_OP;
+    if (x.flags != y.flags)                                          m |= AMB_GD_FLAGS;
+    if (x.buffer != y.buffer)                                        m |= AMB_GD_BUFFER;
+    if (memcmp(x.name, y.name, sizeof(x.name)) != 0)                 m |= AMB_GD_NAME;
+    if (x.extra != y.extra)                                          m |= AMB_GD_EXTRA;
+    if (memcmp(x.padding, y.padding, sizeof(x.padding)) != 0)        m |= AMB_GD_PADDING;
+    if (m == 0)                                                      m |= AMB_GD_UNKNOWN;
+
+    if (detail == nullptr) {
+        return m;
+    }
+    size_t o = 0;
+    detail[0] = '\0';
+    if (m & AMB_GD_NE) {
+        amb_gd_add(detail, detail_len, o, " ne=[%lld,%lld,%lld,%lld]->[%lld,%lld,%lld,%lld]",
+            (long long) x.ne[0], (long long) x.ne[1], (long long) x.ne[2], (long long) x.ne[3],
+            (long long) y.ne[0], (long long) y.ne[1], (long long) y.ne[2], (long long) y.ne[3]);
+    }
+    if (m & AMB_GD_DATA) {
+        amb_gd_add(detail, detail_len, o, " data=%p->%p(delta %lld)", x.data, y.data,
+            (long long) ((intptr_t) y.data - (intptr_t) x.data));
+    }
+    if (m & AMB_GD_OP_PARAMS) {
+        for (size_t k = 0; k < sizeof(x.op_params)/sizeof(x.op_params[0]); ++k) {
+            if (x.op_params[k] != y.op_params[k]) {
+                amb_gd_add(detail, detail_len, o, " op_params[%zu]=%d->%d(0x%08x->0x%08x)", k,
+                    x.op_params[k], y.op_params[k], (unsigned) x.op_params[k], (unsigned) y.op_params[k]);
+                break;
+            }
+        }
+    }
+    if (m & AMB_GD_VIEW_SRC) {
+        amb_gd_add(detail, detail_len, o, " view_src=%p->%p", (const void *) x.view_src, (const void *) y.view_src);
+    }
+    if (m & AMB_GD_VIEW_OFFS) {
+        amb_gd_add(detail, detail_len, o, " view_offs=%zu->%zu", x.view_offs, y.view_offs);
+    }
+    if (m & (AMB_GD_SRC_DATA | AMB_GD_SRC_TPTR | AMB_GD_SRC_NE | AMB_GD_SRC_NB)) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const bool dd = a.node_src_data_ptrs[j] != b.node_src_data_ptrs[j];
+            const bool dt = x.src[j] != y.src[j];
+            const bool dn = memcmp(a.node_src_ne[j], b.node_src_ne[j], sizeof(a.node_src_ne[j])) != 0;
+            const bool db = memcmp(a.node_src_nb[j], b.node_src_nb[j], sizeof(a.node_src_nb[j])) != 0;
+            if (!(dd || dt || dn || db)) {
+                continue;
+            }
+            amb_gd_add(detail, detail_len, o, " src[%d]='%s'", j, node->src[j] ? node->src[j]->name : "(null)");
+            if (dd) {
+                amb_gd_add(detail, detail_len, o, " src_data=%p->%p(delta %lld)", a.node_src_data_ptrs[j],
+                    b.node_src_data_ptrs[j],
+                    (long long) ((intptr_t) b.node_src_data_ptrs[j] - (intptr_t) a.node_src_data_ptrs[j]));
+            }
+            if (dt) {
+                amb_gd_add(detail, detail_len, o, " src_tensor=%p->%p", (const void *) x.src[j], (const void *) y.src[j]);
+            }
+            if (dn) {
+                amb_gd_add(detail, detail_len, o, " src_ne=[%lld,%lld,%lld,%lld]->[%lld,%lld,%lld,%lld]",
+                    (long long) a.node_src_ne[j][0], (long long) a.node_src_ne[j][1],
+                    (long long) a.node_src_ne[j][2], (long long) a.node_src_ne[j][3],
+                    (long long) b.node_src_ne[j][0], (long long) b.node_src_ne[j][1],
+                    (long long) b.node_src_ne[j][2], (long long) b.node_src_ne[j][3]);
+            }
+            if (db) {
+                amb_gd_add(detail, detail_len, o, " src_nb_changed");
+            }
+            break; // first differing src only
+        }
+    }
+    return m;
+}
+
+static amb_gd_key_stats & amb_gd_stats_locked(const void * ctx, uint64_t key) {
+    return amb_gd().keys[std::make_pair(ctx, key)];
+}
+
+// the graph key of a cached graph entry (diagnostic path only: a scan of the backend's graph map)
+static uint64_t amb_gd_key_of(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph * graph) {
+    for (const auto & [key, g] : cuda_ctx->cuda_graphs) {
+        if (g.get() == graph) {
+            return key;
+        }
+    }
+    return 0;
+}
+
+// kind: 0 = cudaGraphExecUpdate ok, 1 = instantiate after update failure, 2 = instantiate after cluster change,
+// 3 = instantiate of a new chunk
+static void amb_gd_note_exec(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph * graph, size_t idx, int kind, int update_result) {
+    const uint64_t key = amb_gd_key_of(cuda_ctx, graph);
+    int n_nodes = 0;
+    {
+        amb_gd_state & st = amb_gd();
+        std::lock_guard<std::mutex> lock(st.mtx);
+        amb_gd_key_stats & ks = amb_gd_stats_locked(cuda_ctx, key);
+        n_nodes = ks.n_nodes;
+        switch (kind) {
+            case 0:  ks.exec_upd_ok++; break;
+            case 1:  ks.inst_fail++;   break;
+            case 2:  ks.inst_clust++;  break;
+            default: ks.inst_new++;    break;
+        }
+    }
+    if (kind != 0 && amb_gd_take_line()) {
+        GGML_LOG_INFO("amb_graph_diff: instantiate ctx=%p dev=%d key=%016llx n_nodes=%d chunk=%zu reason=%s update_result=%d\n",
+            (const void *) cuda_ctx, cuda_ctx->device, (unsigned long long) key, n_nodes, idx,
+            kind == 1 ? "exec_update_failed" : kind == 2 ? "cluster_dims_changed" : "new_chunk", update_result);
+    }
+}
+
+// per-backend summary; erase = at backend free (drops the backend's rows)
+static void amb_gd_report_ctx(ggml_backend_cuda_context * cuda_ctx, const char * when, bool erase) {
+    amb_gd_state & st = amb_gd();
+    std::vector<std::pair<uint64_t, amb_gd_key_stats>> rows;
+    {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        for (auto it = st.keys.begin(); it != st.keys.end(); ) {
+            if (it->first.first == (const void *) cuda_ctx) {
+                rows.emplace_back(it->first.second, it->second);
+                it = erase ? st.keys.erase(it) : std::next(it);
+            } else {
+                ++it;
+            }
+        }
+        if (erase) {
+            st.checks_per_ctx.erase(cuda_ctx);
+        }
+    }
+    if (rows.empty()) {
+        return;
+    }
+    amb_gd_key_stats tot;
+    for (const auto & r : rows) {
+        tot.checks      += r.second.checks;
+        tot.req_true    += r.second.req_true;
+        tot.changed     += r.second.changed;
+        tot.inst_new    += r.second.inst_new;
+        tot.inst_fail   += r.second.inst_fail;
+        tot.inst_clust  += r.second.inst_clust;
+        tot.exec_upd_ok += r.second.exec_upd_ok;
+        tot.field_mask  |= r.second.field_mask;
+    }
+    char fm[256];
+    amb_gd_mask_str(tot.field_mask, fm, sizeof(fm));
+    GGML_LOG_INFO("amb_graph_diff: summary (%s) ctx=%p dev=%d cuda_graphs=%zu keys_seen=%zu checks=%llu "
+        "update_required=%llu changed_existing=%llu instantiate=%llu (new_chunk=%llu after_update_fail=%llu "
+        "cluster=%llu) exec_update_ok=%llu fields=%s\n",
+        when, (const void *) cuda_ctx, cuda_ctx->device, cuda_ctx->cuda_graphs.size(), rows.size(),
+        (unsigned long long) tot.checks, (unsigned long long) tot.req_true, (unsigned long long) tot.changed,
+        (unsigned long long) (tot.inst_new + tot.inst_fail + tot.inst_clust), (unsigned long long) tot.inst_new,
+        (unsigned long long) tot.inst_fail, (unsigned long long) tot.inst_clust, (unsigned long long) tot.exec_upd_ok, fm);
+    std::sort(rows.begin(), rows.end(), [](const std::pair<uint64_t, amb_gd_key_stats> & p, const std::pair<uint64_t, amb_gd_key_stats> & q) {
+        return p.second.req_true > q.second.req_true;
+    });
+    for (size_t i = 0; i < rows.size() && i < 10; ++i) {
+        const amb_gd_key_stats & s = rows[i].second;
+        amb_gd_mask_str(s.field_mask, fm, sizeof(fm));
+        GGML_LOG_INFO("amb_graph_diff:   top%zu key=%016llx n_nodes=%d first='%s' checks=%llu update_required=%llu "
+            "changed_existing=%llu instantiate=%llu (new_chunk=%llu after_update_fail=%llu cluster=%llu) "
+            "exec_update_ok=%llu fields=%s\n",
+            i + 1, (unsigned long long) rows[i].first, s.n_nodes, s.first_name, (unsigned long long) s.checks,
+            (unsigned long long) s.req_true, (unsigned long long) s.changed,
+            (unsigned long long) (s.inst_new + s.inst_fail + s.inst_clust), (unsigned long long) s.inst_new,
+            (unsigned long long) s.inst_fail, (unsigned long long) s.inst_clust, (unsigned long long) s.exec_upd_ok, fm);
+    }
+}
+
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
@@ -4903,6 +5801,14 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     graph->uid = cgraph->uid;
+
+    // AMB_GRAPH_DIFF_LOG: the saved properties of an existing entry are compared before the loop overwrites them
+    const bool   amb_gd_on  = amb_gd_enabled();
+    const size_t amb_gd_old = graph->node_props.size();
+    int          amb_gd_ndiff = 0, amb_gd_first = -1;
+    uint32_t     amb_gd_mask = 0, amb_gd_first_mask = 0;
+    char         amb_gd_detail[512];
+    amb_gd_detail[0] = '\0';
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -4922,9 +5828,56 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
+        if (amb_gd_on && (size_t) i < amb_gd_old && memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            const bool first = amb_gd_first < 0;
+            const uint32_t m = amb_gd_classify(graph->node_props[i], prop, cgraph->nodes[i],
+                first ? amb_gd_detail : nullptr, sizeof(amb_gd_detail));
+            if (first) {
+                amb_gd_first      = i;
+                amb_gd_first_mask = m;
+            }
+            amb_gd_mask |= m;
+            amb_gd_ndiff++;
+        }
+
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
             graph->node_props[i] = prop;
             res = true;
+        }
+    }
+
+    if (amb_gd_on) {
+        const bool existing = amb_gd_old > 0;
+        const bool changed  = existing && res;
+        uint64_t   n_checks = 0;
+        {
+            amb_gd_state & st = amb_gd();
+            std::lock_guard<std::mutex> lock(st.mtx);
+            amb_gd_key_stats & ks = amb_gd_stats_locked(cuda_ctx, graph_key);
+            ks.checks++;
+            ks.req_true   += res ? 1 : 0;
+            ks.changed    += changed ? 1 : 0;
+            ks.field_mask |= amb_gd_mask;
+            ks.n_nodes     = cgraph->n_nodes;
+            if (cgraph->n_nodes > 0) {
+                snprintf(ks.first_name, sizeof(ks.first_name), "%s", cgraph->nodes[0]->name);
+            }
+            n_checks = ++st.checks_per_ctx[cuda_ctx];
+        }
+        if (changed && amb_gd_take_line()) {
+            char fm[256], fall[256];
+            amb_gd_mask_str(amb_gd_first_mask, fm, sizeof(fm));
+            amb_gd_mask_str(amb_gd_mask, fall, sizeof(fall));
+            const ggml_tensor * fn = amb_gd_first >= 0 ? cgraph->nodes[amb_gd_first] : nullptr;
+            GGML_LOG_INFO("amb_graph_diff: changed ctx=%p dev=%d key=%016llx n_nodes=%d count_changed=%s(was %zu) "
+                "ndiff=%d first=%d name='%s' op=%s fields=%s%s all_fields=%s\n",
+                (const void *) cuda_ctx, cuda_ctx->device, (unsigned long long) graph_key, cgraph->n_nodes,
+                (size_t) cgraph->n_nodes != amb_gd_old ? "yes" : "no", amb_gd_old, amb_gd_ndiff, amb_gd_first,
+                fn ? fn->name : "-", fn ? ggml_op_desc(fn) : "-", fm, amb_gd_detail, fall);
+        }
+        const uint64_t every = amb_gd_summary_every();
+        if (every > 0 && n_checks % every == 0) {
+            amb_gd_report_ctx(cuda_ctx, "periodic", false);
         }
     }
 
@@ -4963,7 +5916,10 @@ static std::vector<ggml_cuda_graph_cluster> ggml_cuda_graph_get_clusters(cudaGra
 }
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
 
-static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device) {
+// returns what it did, for AMB_GRAPH_DIFF_LOG: 0 = cudaGraphExecUpdate succeeded, 1 = re-instantiated after the
+// update failed (*update_result = cudaGraphExecUpdateResult), 2 = re-instantiated after a cluster-dims change
+static int ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device, int * update_result) {
+    *update_result = 0;
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
     std::vector<ggml_cuda_graph_cluster> clusters = ggml_cuda_graph_get_clusters(cuda_graph, device);
     if (instance.clusters != clusters) {
@@ -4973,7 +5929,7 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
         instance.clusters = std::move(clusters);
-        return;
+        return 2;
     }
 #else
     GGML_UNUSED(device);
@@ -4999,9 +5955,16 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         instance.handle = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+#if CUDART_VERSION >= 12000 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        *update_result = (int) result_info.result;
+#else
+        *update_result = -1;
+#endif
+        return 1;
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+    return 0;
 }
 
 // number of ggml nodes per CUDA graph chunk, 0 captures the whole ggml graph as one CUDA graph
@@ -5019,7 +5982,11 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
 
     if (idx < graph->instances.size()) {
-        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
+        int update_result = 0;
+        const int kind = ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device, &update_result);
+        if (amb_gd_enabled()) {
+            amb_gd_note_exec(cuda_ctx, graph, idx, kind, update_result);
+        }
     } else {
         GGML_ASSERT(idx == graph->instances.size());
         graph->instances.emplace_back();
@@ -5027,6 +5994,9 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
         graph->instances[idx].clusters = ggml_cuda_graph_get_clusters(cuda_graph, cuda_ctx->device);
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
+        if (amb_gd_enabled()) {
+            amb_gd_note_exec(cuda_ctx, graph, idx, 3, 0);
+        }
     }
     CUDA_CHECK(cudaGraphDestroy(cuda_graph));
 
@@ -5700,6 +6670,61 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+
+// returns the number of nodes after node i taken by a fused SiTU gate, 0 if the nodes at i do not form one
+static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const ggml_op ops[10] = {
+        GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+        GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    const int n = 10;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        if (t->op != ops[k] || t->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    ggml_tensor ** nd = cgraph->nodes + i;
+    if (ggml_get_unary_op(nd[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(nd[3]) != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(nd[7]) != GGML_UNARY_OP_TANH) {
+        return 0;
+    }
+    const ggml_tensor * g = nd[0]->src[0];
+    const ggml_tensor * u = nd[5];
+    // a = nd[2], sigmoid(g) = nd[3], sigmoid(g)*a = nd[4], b = nd[8], out = nd[9]
+    if (nd[1]->src[0] != nd[0] || nd[2]->src[0] != nd[1] || nd[3]->src[0] != g ||
+        nd[4]->src[0] != nd[2] || nd[4]->src[1] != nd[3] || nd[6]->src[0] != u || nd[7]->src[0] != nd[6] ||
+        nd[8]->src[0] != nd[7] || nd[9]->src[0] != nd[4] || nd[9]->src[1] != nd[8]) {
+        return 0;
+    }
+    // g and u: same-shape row views of one tensor, rows contiguous, the rows evenly strided
+    if (g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || !ggml_are_same_shape(g, u) || !ggml_are_same_shape(g, nd[9]) ||
+        g->nb[0] != sizeof(float) || u->nb[0] != sizeof(float) || g->nb[1] != u->nb[1] ||
+        g->nb[2] != g->nb[1]*g->ne[1] || u->nb[2] != u->nb[1]*u->ne[1] || g->ne[3] != 1 || !ggml_is_contiguous(nd[9])) {
+        return 0;
+    }
+    float scales[8];
+    memcpy(scales + 0, nd[0]->op_params, 2*sizeof(float));
+    memcpy(scales + 2, nd[2]->op_params, 2*sizeof(float));
+    memcpy(scales + 4, nd[6]->op_params, 2*sizeof(float));
+    memcpy(scales + 6, nd[8]->op_params, 2*sizeof(float));
+
+    // the u view reads the gate_up product outside the chain, so it is checked here and left out of the subgraph test
+    if (ggml_node_get_use_count(cgraph, i + 5) != 1) {
+        return 0;
+    }
+    const int idxs[9]   = { i, i + 1, i + 2, i + 3, i + 4, i + 6, i + 7, i + 8, i + 9 };
+    const ggml_op ops9[9] = { ops[0], ops[1], ops[2], ops[3], ops[4], ops[6], ops[7], ops[8], ops[9] };
+    const int out_idx = i + n - 1;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 9, ops9, &out_idx, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &out_idx, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_situ_fused(*cuda_ctx, g, u, scales, nd[9]);
+    return n - 1;
+}
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -6377,6 +7402,120 @@ static int amb_mt_try_down(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
 // ---- end AMB_FUSE_SHEXP_MT -------------------------------------------------------------------------------------
 
 // try and fuse nodes and return the number of nodes to skip
+// returns the number of nodes after node i taken by a fused row L2 clip, 0 if the nodes at i do not form one
+static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_op ops[9];
+    int n = 0;
+
+    const ggml_tensor * w  = nullptr;
+    const ggml_tensor * m0 = nullptr;
+    if (cgraph->nodes[i]->op == GGML_OP_MUL) {
+        m0 = cgraph->nodes[i];
+        ops[n++] = GGML_OP_MUL;
+    }
+    if (i + n + 6 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const int i_sqr = i + n;
+    ops[n++] = GGML_OP_SQR;
+    ops[n++] = GGML_OP_SUM_ROWS;
+    ops[n++] = GGML_OP_SQRT;
+    ops[n++] = GGML_OP_SCALE;
+    const bool has_fill = cgraph->nodes[i + n]->op == GGML_OP_FILL;
+    if (has_fill) {
+        ops[n++] = GGML_OP_FILL;
+    }
+    ops[n++] = GGML_OP_DIV;
+    ops[n++] = GGML_OP_CLAMP;
+    ops[n++] = GGML_OP_MUL;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k] || cgraph->nodes[i + k]->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+
+    const ggml_tensor * sqr   = cgraph->nodes[i_sqr];
+    const ggml_tensor * sum   = cgraph->nodes[i_sqr + 1];
+    const ggml_tensor * sqrtn = cgraph->nodes[i_sqr + 2];
+    const ggml_tensor * scl   = cgraph->nodes[i_sqr + 3];
+    const ggml_tensor * fill  = has_fill ? cgraph->nodes[i_sqr + 4] : nullptr;
+    const ggml_tensor * div   = cgraph->nodes[i + n - 3];
+    const ggml_tensor * clamp = cgraph->nodes[i + n - 2];
+    ggml_tensor       * out   = cgraph->nodes[i + n - 1];
+
+    const ggml_tensor * x = sqr->src[0];
+    if (sum->src[0] != sqr || sqrtn->src[0] != sum || scl->src[0] != sqrtn || clamp->src[0] != div ||
+        div->src[1] != scl || out->src[0] != x || out->src[1] != clamp) {
+        return 0;
+    }
+    if (m0) {
+        // c = x*w, w one row per head broadcast over the tokens
+        w = m0->src[1];
+        if (x != m0 || !ggml_are_same_shape(m0, m0->src[0]) || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+            w->ne[0] != m0->ne[0] || m0->ne[1] % w->ne[1] != 0 || w->ne[1] != m0->ne[1] || w->ne[2] != 1 || w->ne[3] != 1) {
+            return 0;
+        }
+        x = m0->src[0];
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(out) || !ggml_are_same_shape(x, out)) {
+        return 0;
+    }
+
+    float scale_bias[2];
+    memcpy(scale_bias, scl->op_params, sizeof(scale_bias));
+    float lo_hi[2];
+    memcpy(lo_hi, clamp->op_params, sizeof(lo_hi));
+    if (scale_bias[0] != 1.0f) {
+        return 0;
+    }
+
+    // the limit: a FILL of this chain, or one value per row
+    const ggml_tensor * limit = nullptr;
+    float limit_value = 0.0f;
+    if (fill) {
+        if (fill->src[0] != scl || div->src[0] != fill) {
+            return 0;
+        }
+        // ggml_fill_inplace(norm) overwrites the denominator before DIV reads it, so the chain divides the
+        // threshold by itself: keep the separate ops
+        if (fill->view_src == scl || fill->data == scl->data) {
+            return 0;
+        }
+        memcpy(&limit_value, fill->op_params, sizeof(float));
+    } else {
+        limit = div->src[0];
+        if (limit->type != GGML_TYPE_F32 || !ggml_is_contiguous(limit) || !ggml_are_same_shape(limit, scl)) {
+            return 0;
+        }
+        // the fused kernel never writes the chain's intermediates, so the limit must not be one of them
+        for (const ggml_tensor * t : { m0, sqr, sum, sqrtn, scl }) {
+            if (t && (limit == t || limit->view_src == t)) {
+                return 0;
+            }
+        }
+    }
+
+    // the fused kernel writes only out and reads the original x, w and limit
+    // an in-place node of the chain (e.g. ggml_sqr_inplace(ctx, c)) overwrites a tensor that later nodes read, so keep the separate ops
+    for (int k = 0; k < n - 1; ++k) {
+        if (cgraph->nodes[i + k]->view_src != nullptr) {
+            return 0;
+        }
+    }
+
+    const int out_idx = i + n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, &out_idx, 1) ||
+        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &out_idx, 1)) {
+        return 0;
+    }
+
+    ggml_cuda_op_clip_rows_fused(*cuda_ctx, x, w, limit, limit_value, scale_bias[1], lo_hi[0], lo_hi[1], out);
+    return n - 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6390,6 +7529,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int skip = amb_mt_try_down(*cuda_ctx, cgraph, i);
         if (skip != 0) {
             return skip;
+        }
+    }
+
+    // depth mix after an RMS_NORM: CONCAT, CONCAT, [REPEAT,] MUL_MAT, SOFT_MAX, [MUL_MAT]
+    {
+        static const bool depth_mix_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_DEPTH_MIX_FUSION");
+        const int n_fused = depth_mix_disabled ? 0 : ggml_cuda_try_fuse_depth_mix(cuda_ctx, cgraph, i,
+            [](const ggml_cgraph * g, int idx, int cnt, const int * outs, int n_outs) {
+                return ggml_cuda_check_fusion_memory_ranges(g, idx, cnt, outs, n_outs);
+            });
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
@@ -6425,6 +7576,59 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // y = c -/+ tanh(a)*b: UNARY(TANH), MUL, SUB/ADD
+    if (node->op == GGML_OP_UNARY) {
+        static const bool tanh_mul_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_TANH_MUL_ADDSUB_FUSION");
+        ggml_cuda_tanh_mul_addsub_match match;
+        // the elementwise kernel may run in place: the matcher checks the overlaps
+        const int n = tanh_mul_disabled ? 0 : ggml_cuda_match_tanh_mul_addsub(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_tanh_mul_addsub(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+
+    // normalized router weights: SUM_ROWS, SCALE/CLAMP, DIV[, RESHAPE, SCALE]
+    if (node->op == GGML_OP_SUM_ROWS) {
+        static const bool row_norm_div_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_ROW_NORM_DIV_FUSION");
+        ggml_cuda_row_norm_div_match match;
+        const int n = row_norm_div_disabled ? 0 : ggml_cuda_match_row_norm_div(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_row_norm_div(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+
+    // ADD, [RESHAPE,] RMS_NORM of the sum: one kernel writes the sum and the norm
+    // bit-identical to the separate ADD + RMS_NORM only where measured: NVIDIA cc >= 10.0 (B200, RTX PRO 6000); it is
+    // 1 ulp off on T4, L4, A100 and HIP, so it stays off there
+    if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes &&
+            GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc >= 1000) {
+        static const bool add_rms_norm_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_ADD_RMS_NORM_FUSION");
+        const bool has_reshape = cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE;
+        const int  n           = has_reshape ? 3 : 2;
+        if (!add_rms_norm_disabled && i + n - 1 < cgraph->n_nodes) {
+            ggml_tensor * rms  = cgraph->nodes[i + n - 1];
+            ggml_tensor * next = i + n < cgraph->n_nodes ? cgraph->nodes[i + n] : nullptr;
+            const ggml_op ops[3] = { GGML_OP_ADD, has_reshape ? GGML_OP_RESHAPE : GGML_OP_RMS_NORM, GGML_OP_RMS_NORM };
+            const int outputs[2] = { i, i + n - 1 };
+            // a following MUL or SCALE of the norm is fused with it by the RMS_NORM fusions instead
+            const bool norm_fused_later = next && (next->op == GGML_OP_MUL || next->op == GGML_OP_SCALE) &&
+                (next->src[0] == rms || next->src[1] == rms);
+            if (rms->op == GGML_OP_RMS_NORM && !norm_fused_later &&
+                rms->src[0] == (has_reshape ? cgraph->nodes[i + 1] : node) && (!has_reshape || cgraph->nodes[i + 1]->src[0] == node) &&
+                ggml_can_fuse_subgraph(cgraph, i, n, ops, outputs, 2) && ggml_cuda_add_rms_norm_supported(node, rms) &&
+                // the sum may be written over a or b; each thread reads a and b only at the elements it writes
+                ggml_cuda_elem_overlap_ok(node, node->src[0]) && ggml_cuda_elem_overlap_ok(node, node->src[1]) &&
+                ggml_cuda_elem_overlap_ok(rms, node->src[0]) && ggml_cuda_elem_overlap_ok(rms, node->src[1]) &&
+                ggml_cuda_elem_overlap_ok(rms, node) && rms->data != node->data) {
+                ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, rms);
+                return n - 1;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -6450,6 +7654,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // short convolution with a residual: CONCAT, state store, SSM_CONV, [CONT, (MUL, ADD) x n_conv], ADD, SCALE
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool conv_chain_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SHORT_CONV_FUSION");
+        const int n_fused = conv_chain_disabled ? 0 : ggml_cuda_try_fuse_conv_chain(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
@@ -6531,6 +7744,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // SiTU gate: SCALE, TANH, SCALE, SIGMOID, MUL, VIEW, SCALE, TANH, SCALE, MUL
+    if (node->op == GGML_OP_SCALE) {
+        static const bool situ_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_SITU_FUSION");
+        const int n_fused = situ_disabled ? 0 : ggml_cuda_try_fuse_situ(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
@@ -6538,6 +7760,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
         return 2;
+    }
+
+    // relative-position bias gathered into the F16 mask of a flash attention: read in the vector kernel
+    if (node->op == GGML_OP_SUB || node->op == GGML_OP_CONT || node->op == GGML_OP_GET_ROWS) {
+        static const bool rel_bias_fa_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_REL_BIAS_FA_FUSION");
+        const int n_fused = rel_bias_fa_disabled || !cuda_ctx->stream_context().concurrent_events.empty() ? 0 :
+            ggml_cuda_try_fuse_rel_bias_fa(*cuda_ctx, cgraph, i, ggml_cuda_compute_forward);
+        if (n_fused > 0) {
+            return n_fused;
+        }
     }
 
     // Snake activation: y = x + sin(a*x)^2 * inv_b
@@ -6584,6 +7816,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // row L2 clip: [MUL,] SQR, SUM_ROWS, SQRT, SCALE, [FILL,] DIV, CLAMP, MUL
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
+        static const bool clip_rows_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CLIP_ROWS_FUSION");
+        const int n_fused = clip_rows_disabled ? 0 : ggml_cuda_try_fuse_clip_rows(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
         }
     }
 
@@ -7435,6 +8676,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             amb_mt_stats_begin(); // AMB_FUSE_SHEXP_MT counters of this evaluation/capture
 
+            // MUL_MAT nodes that read the same src1 quantize it once (see ggml_cuda_src1_cache)
+            static const bool src1_cache_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_Q8_1_REUSE");
+            ggml_cuda_src1_cache & src1_cache = cuda_ctx->src1_cache;
+            src1_cache.release();
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -7491,7 +8737,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     amb_t0 = std::chrono::steady_clock::now();
                 }
 
+                // only a MUL_MAT node of the graph, on one stream, uses the cache: the cache is freed between nodes,
+                // so no pool allocation of a caller may be live below it
+                if (is_concurrent_event_active) {
+                    src1_cache.release();
+                }
+                src1_cache.enabled = !src1_cache_disabled && !is_concurrent_event_active && node->op == GGML_OP_MUL_MAT;
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                src1_cache.enabled = false;
+                for (int k = i; k <= i + nodes_to_skip && src1_cache.src1; ++k) {
+                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                        src1_cache.invalidate_if_written(cgraph->nodes[k]);
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
                     if (amb_timed) {
@@ -7526,7 +8786,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (amb_timed) {
                     amb_t0 = std::chrono::steady_clock::now(); // exclude the failed fusion matching
                 }
+                src1_cache.enabled = !src1_cache_disabled && !is_concurrent_event_active && node->op == GGML_OP_MUL_MAT;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                src1_cache.enabled = false;
+                src1_cache.invalidate_if_written(node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -7539,6 +8802,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            src1_cache.release();
 
             amb_mt_stats_end(cgraph, use_cuda_graph && cuda_graph_update_required);
         }
@@ -7594,6 +8858,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->amb_zc_compute.store(true, std::memory_order_relaxed); // AMB_H2D_ZC: this backend's stream is a compute stream
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -8153,7 +9418,26 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     }
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
-    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    // AMB_H2D_ZC: first tried also mapped, so the copy kernel can read it; if that fails, registered with the
+    // original flags and no zero-copy entry (the flags and the single call are unchanged when the switch is off)
+    const unsigned int flags = cudaHostRegisterPortable | cudaHostRegisterReadOnly;
+    bool zc_mapped = false;
+    cudaError_t err = cudaSuccess;
+#ifdef AMB_ZC_SUPPORTED
+    if (amb_zc_enabled()) {
+        err = cudaHostRegister(buffer, size, flags | cudaHostRegisterMapped);
+        if (err == cudaSuccess) {
+            zc_mapped = true;
+        } else {
+            (void)cudaGetLastError();
+            GGML_LOG_WARN("%s: AMB_H2D_ZC: mapped registration of %.2f MiB failed (%s); registering unmapped, copies from it stay DMA\n",
+                __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        }
+    }
+#endif // AMB_ZC_SUPPORTED
+    if (!zc_mapped) {
+        err = cudaHostRegister(buffer, size, flags);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -8161,6 +9445,9 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
         GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return false;
+    }
+    if (zc_mapped) {
+        amb_zc_add_range(buffer, size, false);
     }
     return true;
 #else
@@ -8175,6 +9462,7 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
         return;
     }
 
+    amb_zc_remove_range(buffer);
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {
         // clear the error

@@ -1,7 +1,8 @@
 # Building the engine
 
-The engine is the `engine/` tree: Unsloth's llama.cpp build b12588 (which has the `inkling2` architecture and the DSpark
-drafter) with the Inkling changes on top. It builds like llama.cpp with the CUDA backend.
+The engine is the `engine/` tree: Unsloth's llama.cpp build b12649 (which has the `inkling2` and `inkling2_loop`
+architectures, so it loads both the original and the current Unsloth GGUF layout, and the DSpark drafter) with the Inkling
+changes on top. It builds like llama.cpp with the CUDA backend.
 
 ## Tested toolchain
 

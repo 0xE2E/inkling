@@ -1282,8 +1282,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     common_fit_apply(params, mparams, cparams);
 
     if (params.fit_params && params.moe_cache_auto) {
-        // the fit writes its expert placement into params, keep the cache size it chose with it,
-        // so that a reload from params (e.g. the server waking from sleep) gets the same cache
+        // the fit writes its expert placement into params, keep the cache size it chose with it, so that a reload from params (e.g. the server waking from sleep) gets the same cache
         params.moe_cache_size = cparams.moe_cache_size;
         params.moe_cache_auto = false;
     } else if (params.moe_cache_auto) {
@@ -1443,6 +1442,10 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 
 // only for warmup and probe decodes, fill zeros as dummy input
 static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
+    // the fused Inkling2 DSpark draft takes a 3*n_embd state that only drafting fills: its probe and warmup decodes run without one
+    if (llama_model_dflash_variant(model) == LLAMA_DFLASH_VARIANT_DSPARK_INKLING2) {
+        return;
+    }
     zeros.assign(llama_model_n_embd_out(model), 0.0f);
     for (int32_t i = 0; i < batch.size(); ++i) {
         batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from functools import partial
@@ -66,34 +65,11 @@ def _dequant_expert_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tens
     return values
 
 
-def _nvfp4_expert_rows(packed: np.ndarray, scales: np.ndarray, name: str, expert: int) -> np.ndarray:
-    # checkpoint rows (low nibble first, E4M3 scale per 16) -> block_nvfp4: 4 scales, then byte j holds elements j, j + 8
-    n, half = packed.shape
-    nb = scales.shape[1]
-    if half * 2 != nb * 16 or nb % 4:
-        raise ValueError(f"Inkling2: {name} expert {expert}: {half * 2} columns do not form NVFP4 blocks of 64")
-    if np.any(scales & 0x80) or np.any(scales == 0x7F):
-        raise ValueError(f"Inkling2: {name}_scale expert {expert}: block scales must be non-negative and finite to keep NVFP4")
-    nibbles = np.stack([packed & 15, packed >> 4], axis=-1).reshape(n, nb, 16)
-    qs = (nibbles[:, :, :8] | (nibbles[:, :, 8:] << 4)).astype(np.uint8)
-    blocks = np.concatenate([scales.reshape(n, nb // 4, 4), qs.reshape(n, nb // 4, 32)], axis=-1)
-    return blocks.reshape(n, nb // 4 * 36)
-
-
-def _nvfp4_expert(weight: Callable[[], Tensor], scale: Callable[[], Tensor], name: str, expert: int, w13: bool) -> np.ndarray:
-    packed = LazyTorchTensor.to_eager(weight().view(torch.uint8)[expert]).numpy()
-    scales = LazyTorchTensor.to_eager(scale().view(torch.uint8)[expert]).numpy()
-    if not w13:
-        return _nvfp4_expert_rows(packed, scales, name, expert)
-    # the checkpoint interleaves gate and up rows
-    return np.concatenate([_nvfp4_expert_rows(packed[half::2], scales[half::2], name, expert) for half in (0, 1)])
-
-
 def _is_inkling2(dir_model: Path) -> bool:
     if not (dir_model / "config.json").is_file():
         return False
     with open(dir_model / "config.json", encoding="utf-8") as f:
-        return json.load(f).get("model_type") in ("inkling2", "inkling2_text", "inkling2_loop")
+        return json.load(f).get("model_type") in ("inkling2", "inkling2_text", "inkling2_loop", "inkling2_loop_text")
 
 
 @ModelBase.register_hparams_loader(_is_inkling2)
@@ -101,20 +77,6 @@ def _load_inkling2_hparams(dir_model: Path):
     # AutoConfig injects MXFP8 defaults and can replace the original layer schedule.
     with open(dir_model / "config.json", encoding="utf-8") as f:
         return json.load(f)
-
-
-def _set_inkling2_vocab(model: TextModel):
-    tokens, types, pre = model.get_vocab_base()
-    model.gguf_writer.add_tokenizer_model("gpt2")
-    model.gguf_writer.add_tokenizer_pre(pre)
-    model.gguf_writer.add_token_list(tokens)
-    model.gguf_writer.add_token_types(types)
-    special = gguf.SpecialVocab(model.dir_model, load_merges=True)
-    eos = model.hparams.get("eos_token_id", 200006)
-    special.special_token_ids["eos"] = eos
-    special.special_token_ids["eot"] = eos
-    special.add_special_token["bos"] = False
-    special.add_to_gguf(model.gguf_writer)
 
 
 @ModelBase.register("Inkling2ForConditionalGeneration", "Inkling2ForCausalLM")
@@ -125,9 +87,6 @@ class Inkling2Model(TextModel):
     def __init__(self, dir_model: Path, *args, **kwargs):
         self._expert_quant: dict[str, dict] = {}
         self._packed_experts: dict[str, gguf.LazyChunkedTensor] = {}
-        # INKLING2_NVFP4_NATIVE=1 keeps NVFP4 experts as GGML NVFP4 with a per-expert scale
-        self._native_nvfp4 = os.environ.get("INKLING2_NVFP4_NATIVE", "0") == "1"
-        self._native_experts: dict[str, tuple[gguf.LazyChunkedTensor, np.ndarray]] = {}
         quant_path = dir_model / "hf_quant_config.json"
         if quant_path.is_file():
             with open(quant_path, encoding="utf-8") as f:
@@ -141,7 +100,7 @@ class Inkling2Model(TextModel):
                             raise ValueError(f"Inkling2: duplicate hf_quant_config.json scheme for {name}")
                         self._expert_quant[name] = group
         super().__init__(dir_model, *args, **kwargs)
-        logger.warning("Inkling2: converting text only; use --mmproj for vision and --dspark for mtp.safetensors")
+        logger.warning("Inkling2: converting the text backbone only; vision and MTP tensors are skipped")
         hp = self.hparams
         for name, default in (("q_bias", False), ("o_bias", False), ("n_shared_experts", 0), ("use_value_norm_no_gamma", True), ("attn_res_normalize_values", True), ("scoring_func", "sigmoid")):
             if hp.get(name, default) != default:
@@ -153,18 +112,6 @@ class Inkling2Model(TextModel):
         if len(types) != self.block_count or set(types) - {"hybrid", "hybrid_sliding"}:
             raise ValueError("Inkling2: invalid layer_types")
         self.is_swa = [t == "hybrid_sliding" for t in types]
-        # looped variant: one GGUF block per layer visit
-        self.loop = hp.get("loop_config")
-        self.visits = list(range(self.block_count))
-        if self.loop is not None:
-            loop = self.loop
-            if loop.get("is_varloop", False):
-                raise ValueError("Inkling2: is_varloop (a serve-time pass count, shared KV across passes) is not supported")
-            start, end, passes, rank = (loop.get(k) for k in ("core_start", "core_end", "num_passes", "gate_rank"))
-            block = hp["n_layers_per_attn_res_block"]
-            if not all(isinstance(v, int) for v in (start, end, passes, rank)) or not (0 < start < end <= self.block_count) or start % block or end % block or passes < 2 or rank <= 0:
-                raise ValueError(f"Inkling2: invalid loop_config {loop!r}")
-            self.visits = list(range(start)) + list(range(start, end)) * passes + list(range(end, self.block_count))
 
     def dequant_model(self):
         for name in list(self.model_tensors):
@@ -218,20 +165,6 @@ class Inkling2Model(TextModel):
                     t = gen()
                     if t.dtype != torch.float32 or tuple(t.shape) != expected:
                         raise ValueError(f"Inkling2: {companion}: expected F32 {expected}, got {t.dtype} {tuple(t.shape)}")
-            if nvfp4 and self._native_nvfp4:
-                a = LazyTorchTensor.to_eager(amax()).numpy().astype(np.float32)
-                d = LazyTorchTensor.to_eager(denominator()).numpy().astype(np.float32)
-                if not np.isfinite(a).all() or (a < 0).any() or not np.isfinite(d).all() or (d <= 0).any():
-                    raise ValueError(f"Inkling2: {name}: amax must be finite and nonnegative, the denominator finite and positive")
-                byte_shape = (experts, rows, cols // 64 * 36)
-                if cols % 64:
-                    raise ValueError(f"Inkling2: {name}: {cols} columns do not form NVFP4 blocks of 64")
-                chunks_native = [partial(_nvfp4_expert, weight, scale, name, expert, w13) for expert in range(experts)]
-                self._native_experts[name] = (gguf.LazyChunkedTensor(chunks_native, byte_shape, np.uint8), a / d)
-                self.model_tensors[name] = lambda shape=shape: torch.empty(shape, dtype=torch.float32, device="meta")
-                for companion in required:
-                    del self.model_tensors[companion]
-                continue
             chunks: list[Callable[[], np.ndarray]] = []
             for expert in range(experts):
                 for half in range(2 if w13 else 1):
@@ -248,33 +181,6 @@ class Inkling2Model(TextModel):
             t = gen()
             if not t.dtype.is_floating_point or t.element_size() == 1 or name.endswith(("_weight_scale", "_weight_amax", "_weight_outer_scale_denominator")):
                 raise ValueError(f"Inkling2: unexpected packed tensor or orphan companion {name}")
-        missing = sorted(set(self._expected_tensors()) - set(self.model_tensors)) if self.loop is not None else []
-        if missing:
-            raise ValueError(f"Inkling2: {len(missing)} missing tensors, first: {missing[:4]}")
-
-    def _expected_tensors(self) -> list[str]:
-        hp = self.hparams
-        names = ["model.embed.weight", "model.embed_norm.weight", "model.unembed.weight", "model.norm.weight", "model.attn_res.output_query"]
-        for i in range(self.block_count):
-            lp = f"model.layers.{i}."
-            names += [lp + f"attn.{w}.weight" for w in ("wq_du", "wk_dv", "wv_dv", "wo_ud", "gate_attn", "wr_du", "attn_sink_proj")]
-            names += [lp + "attn.q_l2_clip.scale", lp + "attn.rel_l2_clip.scale", lp + "attn.rel_logits_proj.proj"]
-            names += [lp + "attn_sconv.weight", lp + "mlp_sconv.weight", lp + "mlp_norm.weight", lp + "mlp.gate.weight"]
-            names += [lp + "mlp.experts.w13_weight", lp + "mlp.experts.w2_weight", f"model.attn_res.mlp_queries.{i}"]
-            if i > 0:
-                names.append(lp + "attention_input.query")
-            if self.is_swa[i]:
-                names += [lp + "attn_norm.weight", lp + "attn.k_sconv.weight", lp + "attn.v_sconv.weight"]
-            else:
-                names += [lp + f"{n}_input_norm.weight" for n in "qkv"]
-                names += [lp + f"attn.{n}_sconv.{w}" for n in "kv" for w in ("static_w", "weight_proj")]
-            if self.loop is not None and self.loop["core_start"] <= i < self.loop["core_end"]:
-                names += [lp + f"controllers.{m}.{w}_weight" for m in ("attn", "k", "v", "mlp") for w in ("down", "gain", "forget")]
-        if self.loop is not None:
-            names += ["model.middle_cycle_cross_pass_queries", "model.middle_cycle_cross_pass_kv_queries"]
-        if hp.get("use_gate_bias", True):
-            names += [f"model.layers.{i}.mlp.gate.e_score_correction_bias" for i in range(self.block_count)]
-        return names
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -294,7 +200,17 @@ class Inkling2Model(TextModel):
         return tokens[:n], types[:n], pre
 
     def set_vocab(self):
-        _set_inkling2_vocab(self)
+        tokens, types, pre = self.get_vocab_base()
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(pre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(types)
+        special = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        eos = self.hparams["eos_token_id"]
+        special.special_token_ids["eos"] = eos
+        special.special_token_ids["eot"] = eos
+        special.add_special_token["bos"] = False
+        special.add_to_gguf(self.gguf_writer)
 
     def set_gguf_parameters(self):
         hp = self.hparams
@@ -303,19 +219,8 @@ class Inkling2Model(TextModel):
         for name in ("n_routed_experts", "num_experts_per_tok"):
             if name not in hp:
                 raise KeyError(f"Inkling2: missing {name}")
-        hp["num_attention_heads"] = [hp["num_attention_heads"][p] for p in self.visits]
-        hp["num_key_value_heads"] = [hp["num_key_value_heads"][p] for p in self.visits]
-        n_layer, self.block_count = self.block_count, len(self.visits)
-        try:
-            super().set_gguf_parameters()
-        finally:
-            self.block_count = n_layer
+        super().set_gguf_parameters()
         w = self.gguf_writer
-        if self.loop is not None:
-            w.add_num_loops(self.loop["num_passes"])
-            w.add_loop_core_start(self.loop["core_start"])
-            w.add_loop_core_end(self.loop["core_end"])
-            w.add_loop_gate_rank(self.loop["gate_rank"])
         w.add_vocab_size(hp["vocab_size"])
         w.add_vocab_size_unpadded(hp["unpadded_vocab_size"])
         w.add_expert_feed_forward_length(self.find_hparam(["moe_intermediate_size", "intermediate_size"]))
@@ -323,7 +228,7 @@ class Inkling2Model(TextModel):
         w.add_value_length_swa(hp.get("swa_head_dim", hp["head_dim"]))
         w.add_rope_dimension_count(0)
         w.add_sliding_window(hp["sliding_window_size"])
-        w.add_sliding_window_pattern([self.is_swa[p] for p in self.visits])
+        w.add_sliding_window_pattern(self.is_swa)
         w.add_shortconv_l_cache(self.find_hparam(["conv_kernel_size", "sconv_kernel_size"]))
         w.add_expert_weights_scale(hp["route_scale"])
         w.add_activation_situ_beta(hp["mlp_gate_softcap"])
@@ -343,13 +248,6 @@ class Inkling2Model(TextModel):
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if name in self._native_experts:
-            target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
-            new_name = self.map_tensor_name(target, try_suffixes=()) + ".weight"
-            packed, scale = self._native_experts[name]
-            self.gguf_writer.add_tensor(new_name, cast("np.ndarray", packed), raw_dtype=gguf.GGMLQuantizationType.NVFP4)
-            yield new_name.removesuffix(".weight") + ".scale", torch.from_numpy(scale)
-            return
         if name in self._packed_experts:
             target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
             yield self.map_tensor_name(target, try_suffixes=()) + ".weight", cast("Tensor", self._packed_experts[name])
@@ -376,84 +274,229 @@ class Inkling2Model(TextModel):
             yield from super().modify_tensors(data_torch, name, bid)
 
 
-class Inkling2DSparkModel(TextModel):
-    model_arch = gguf.MODEL_ARCH.DFLASH
+@ModelBase.register("Inkling2LoopForConditionalGeneration", "Inkling2LoopForCausalLM")
+class Inkling2LoopModel(Inkling2Model):
+    model_arch = gguf.MODEL_ARCH.INKLING2_LOOP
 
-    def __init__(self, dir_model: Path, *args, **kwargs):
-        config = ModelBase.load_hparams(dir_model, False)
-        text = config.get("text_config", config)
-        mtp = config.get("mtp_config")
-        if not mtp:
-            raise ValueError("Inkling2 DSpark requires mtp_config")
-        if loop := text.get("loop_config"):
-            # the taps of a looped trunk count layer visits, the last one is the final normed hidden state
-            text = {**text, "num_hidden_layers": text["num_hidden_layers"] + (loop["num_passes"] - 1)*(loop["core_end"] - loop["core_start"])}
-        targets = mtp["target_layer_ids"]
-        if (len(targets) < 2 or targets != sorted(set(targets)) or targets[0] < 0 or
-                targets[-1] != text["num_hidden_layers"] or mtp["hidden_size"] != text["hidden_size"] or
-                mtp["markov_head_type"] != "rnn_hidden" or mtp.get("q_bias") or mtp.get("o_bias")):
-            raise ValueError("Unsupported Inkling2 DSpark configuration")
-        if (mtp["block_size"] != 8 or not 0 < mtp["markov_rank"] <= mtp["hidden_size"] or
-                mtp["num_attention_heads"] < 1 or mtp["num_key_value_heads"] < 1 or
-                mtp["num_attention_heads"] % mtp["num_key_value_heads"] or mtp["head_dim"] < 2 or mtp["head_dim"] % 2 or
-                mtp["sliding_window_size"] < 1 or
-                any(i < 0 or i >= mtp["num_hidden_layers"] for i in mtp["local_layer_ids"])):
-            raise ValueError("Invalid Inkling2 DSpark dimensions")
-        hp = {**mtp, "architectures": ["Inkling2ForCausalLM"],
-              "vocab_size": text["vocab_size"], "unpadded_vocab_size": text["unpadded_vocab_size"],
-              "eos_token_id": text.get("eos_token_id", 200006),
-              "final_logit_softcapping": text["final_logit_softcapping"]}
-        super().__init__(dir_model, *args, hparams=hp, **kwargs)
+    # raw checkpoint and transformers names of the cross-pass message queries
+    _query_kinds = {
+        "model.middle_cycle_cross_pass_queries": "q",
+        "model.middle_cycle_cross_pass_kv_queries": "kv",
+        "model.cross_pass_messages.queries": "q",
+        "model.cross_pass_messages.kv_queries": "kv",
+    }
 
-    def index_tensors(self, remote_hf_model_id=None):
-        if remote_hf_model_id is not None:
-            raise ValueError("Inkling2 DSpark requires a local mtp.safetensors")
-        if not (self.dir_model / "mtp.safetensors").is_file():
-            raise ValueError("Inkling2 DSpark requires mtp.safetensors")
-        return self.index_local_tensors("mtp")
-
-    def dequant_model(self):
-        # mtp.safetensors is BF16; hf_quant_config.json only describes the target checkpoint
-        return
-
-    def get_vocab_base(self):
-        tokens, types, pre = super().get_vocab_base()
-        n = self.hparams["unpadded_vocab_size"]
-        return tokens[:n], types[:n], pre
-
-    def set_vocab(self):
-        _set_inkling2_vocab(self)
-        self.gguf_writer.add_mask_token_id(0)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._queries: dict[str, Tensor] = {}
+        self.loop = self.hparams["loop_config"]
+        if set(self.loop) != {"core_start", "core_end", "num_passes", "gate_rank", "is_varloop"}:
+            raise ValueError(f"Inkling2Loop: unsupported loop_config keys {sorted(self.loop)}")
+        start, end, block = self.loop["core_start"], self.loop["core_end"], self.hparams["n_layers_per_attn_res_block"]
+        # a fixed loop needs at least 2 passes, a variable loop at least 1
+        min_passes = 1 if self.loop["is_varloop"] else 2
+        if not 0 < start < end <= self.block_count or start % block or end % block or self.loop["num_passes"] < min_passes or self.loop["gate_rank"] < 1:
+            raise ValueError(f"Inkling2Loop: invalid loop_config {self.loop}")
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        hp, w = self.hparams, self.gguf_writer
-        w.add_vocab_size(hp["vocab_size"])
-        w.add_uint32(gguf.Keys.LLM.VOCAB_SIZE_UNPADDED.format(arch="dflash"), hp["unpadded_vocab_size"])
-        w.add_block_size(hp["block_size"])
-        w.add_target_layers(hp["target_layer_ids"])
-        w.add_uint32(gguf.Keys.LLM.DSPARK_MARKOV_RANK.format(arch="dflash"), hp["markov_rank"])
-        w.add_sample_from_anchor(False)
-        w.add_has_confidence_head(False)
-        w.add_bool("dflash.attention.causal", False)
-        w.add_sliding_window(hp["sliding_window_size"])
-        w.add_sliding_window_pattern([i in hp["local_layer_ids"] for i in range(self.block_count)])
-        w.add_rope_dimension_count(hp["head_dim"])
-        w.add_final_logit_softcapping(hp["final_logit_softcapping"])
+        self.gguf_writer.add_loop_start(self.loop["core_start"])
+        self.gguf_writer.add_loop_end(self.loop["core_end"])
+        self.gguf_writer.add_loop_count(self.loop["num_passes"])
+        self.gguf_writer.add_loop_gate_rank(self.loop["gate_rank"])
+        self.gguf_writer.add_loop_varying(self.loop["is_varloop"])
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        if name == "fuse_weight":
+        # the reference does not quantize the loop tensors
+        if new_name.endswith(("loop_msg_query.weight", "_ctrl_down.weight", "_ctrl_gain.weight", "_ctrl_forget.weight")):
             return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if name in ("mask_embed", "fuse_weight"):
-            yield self.map_tensor_name(name, try_suffixes=()) + ".weight", data_torch
-        else:
+        if name not in self._query_kinds:
             yield from super().modify_tensors(data_torch, name, bid)
+            return
+        self._queries[self._query_kinds[name]] = data_torch
+        if len(self._queries) < 2:
+            return
+        q, kv = self._queries["q"], self._queries["kv"]
+        start = self.loop["core_start"]
+        if q.shape[0] != 2 * (self.loop["core_end"] - start) or kv.shape != q.shape:
+            raise ValueError(f"Inkling2Loop: cross-pass queries {tuple(q.shape)} and {tuple(kv.shape)} do not match the loop core")
+        # core layer start + i mixes its q, k, v and mlp messages with these four queries
+        for i in range(q.shape[0] // 2):
+            query = torch.stack([q[2 * i], kv[2 * i], kv[2 * i + 1], q[2 * i + 1]])
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.LOOP_MSG_QUERY, start + i, ".weight"), query
 
 
-@ModelBase.register("Inkling2ForConditionalGeneration")
+def _fold_markov_chunk(unembed: Callable[[], Tensor], weight: Tensor | None, bias: Tensor | None, rows: slice) -> np.ndarray:
+    head = LazyTorchTensor.to_eager(unembed()[rows]).double()
+    out = head @ weight if weight is not None else head @ bias
+    return out.float().numpy()
+
+
+class Inkling2DSparkModel(Inkling2Model):
+    """Inkling2 DSpark draft (mtp.safetensors) as a DFLASH GGUF, export with --dspark"""
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    _TARGET = {
+        "model.llm.unembed.weight": "target.unembed",
+        "model.language_model.unembed.weight": "target.unembed",
+        "lm_head.weight": "target.unembed",
+        "model.llm.embed_norm.weight": "target.embed_norm",
+        "model.language_model.embed_norm.weight": "target.embed_norm",
+        "model.language_model.embed_tokens.embed_norm.weight": "target.embed_norm",
+    }
+
+    _LAYER = {
+        "self_attn.k_proj_ctx.weight": gguf.MODEL_TENSOR.DFLASH_ATTN_K_CTX,
+        "self_attn.v_proj_ctx.weight": gguf.MODEL_TENSOR.DFLASH_ATTN_V_CTX,
+        "self_attn.k_norm_ctx.weight": gguf.MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM,
+        "dflare_norm.weight":          gguf.MODEL_TENSOR.DFLASH_CTX_NORM,
+    }
+
+    _ROOT = {
+        "target.embed_norm":                gguf.MODEL_TENSOR.TOKEN_EMBD_NORM,
+        "mtp.norm.weight":                  gguf.MODEL_TENSOR.OUTPUT_NORM,
+        "mtp.markov_head.markov_w1.weight": gguf.MODEL_TENSOR.DSPARK_MARKOV_W1,
+        "mtp.markov_head.rnn_proj.weight":  gguf.MODEL_TENSOR.DSPARK_JOINT_PROJ,
+        "mtp.markov_head.rnn_proj.bias":    gguf.MODEL_TENSOR.DSPARK_JOINT_PROJ,
+        "mtp.markov_head.dflare_norm.weight": gguf.MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM,
+    }
+
+    def __init__(self, *args, **kwargs):
+        self._folded: dict[str, gguf.LazyChunkedTensor] = {}
+        super().__init__(*args, **kwargs)
+        hp = self.hparams
+        mtp = hp.get("mtp_config")
+        if not mtp:
+            raise ValueError("Inkling2 DSpark export needs the mtp_config")
+        if mtp.get("markov_head_type") != "rnn_hidden" or mtp.get("q_bias") or mtp.get("o_bias") or mtp["hidden_size"] != hp["hidden_size"]:
+            raise ValueError(f"Inkling2 DSpark: unsupported mtp_config {mtp}")
+        # ids count loop passes, the last id is the final norm output
+        n_visits = self.block_count
+        if (loop := hp.get("loop_config")) is not None:
+            n_visits += (loop["num_passes"] - 1) * (loop["core_end"] - loop["core_start"])
+        targets = mtp["target_layer_ids"]
+        if len(targets) < 2 or targets != sorted(set(targets)) or targets[-1] != n_visits:
+            raise ValueError(f"Inkling2 DSpark: target_layer_ids {targets} must be sorted and end at {n_visits}")
+        self.mtp = mtp
+        self.block_count = mtp["num_hidden_layers"]
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        if remote_hf_model_id is not None:
+            raise NotImplementedError("Inkling2 DSpark export needs a local checkpoint")
+        # mtp.safetensors is not in the weight map, unembed and embed_norm come from the target
+        tensors = self.index_local_tensors("mtp")
+        tensors.update(self.index_local_tensors("model"))
+        return tensors
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name in cls._TARGET:
+            return cls._TARGET[name], gen
+        if name.startswith(("model.", "lm_head.")):
+            return None
+        if name.startswith("layers."):
+            return f"model.{name}", gen
+        return f"mtp.{name}", gen
+
+    def dequant_model(self):
+        super().dequant_model()
+        if "target.unembed" not in self.model_tensors:
+            raise ValueError("Inkling2 DSpark: missing the target unembed")
+        unembed = self.model_tensors.pop("target.unembed")
+        weight = LazyTorchTensor.to_eager(self.model_tensors.pop("mtp.markov_head.hidden_out.weight")()).double()
+        bias = LazyTorchTensor.to_eager(self.model_tensors.pop("mtp.markov_head.hidden_out.bias")()).double()
+        n_vocab, n_embd = unembed().shape
+        if weight.shape[0] != n_embd or bias.shape != (n_embd,):
+            raise ValueError(f"Inkling2 DSpark: hidden_out {tuple(weight.shape)} does not match unembed {(n_vocab, n_embd)}")
+        # markov_w2 = unembed @ hidden_out, fp64 like vLLM, one row chunk at a time
+        # padded tokens are never sampled, so keep only the tokenizer rows
+        n_vocab = self.hparams["unpadded_vocab_size"]
+        row_chunks = [slice(i, min(i + 4096, n_vocab)) for i in range(0, n_vocab, 4096)]
+        for name, w, b, shape in (
+            ("mtp.markov_head.fold.weight", weight, None, (n_vocab, weight.shape[1])),
+            ("mtp.markov_head.fold.bias", None, bias, (n_vocab,)),
+        ):
+            self._folded[name] = gguf.LazyChunkedTensor([partial(_fold_markov_chunk, unembed, w, b, r) for r in row_chunks], shape, np.float32)
+            self.model_tensors[name] = lambda shape=shape: torch.empty(shape, dtype=torch.float32, device="meta")
+
+    def prepare_metadata(self, vocab_only: bool):
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)
+        if from_dir:
+            self.fname_out = self.fname_out.parent / f"dspark-{self.fname_out.name}"
+
+    def set_vocab(self):
+        super().set_vocab()
+        # block uses mask_embd, mask token id is not used
+        self.gguf_writer.add_mask_token_id(0)
+
+    def set_gguf_parameters(self):
+        hp, mtp = self.hparams, self.mtp
+        n = self.block_count
+        w = self.gguf_writer
+        w.add_block_count(n)
+        w.add_context_length(mtp["max_position_embeddings"])
+        w.add_embedding_length(mtp["hidden_size"])
+        w.add_feed_forward_length(mtp["intermediate_size"])
+        w.add_head_count(mtp["num_attention_heads"])
+        w.add_head_count_kv(mtp["num_key_value_heads"])
+        w.add_key_length(mtp["head_dim"])
+        w.add_value_length(mtp["head_dim"])
+        w.add_rope_dimension_count(mtp["head_dim"])
+        w.add_rope_freq_base(float(mtp["rope_theta"]))
+        w.add_layer_norm_rms_eps(mtp["rms_norm_eps"])
+        # the block sees W positions before the anchor, llama.cpp SWA sees n_swa - 1
+        w.add_sliding_window(mtp["sliding_window_size"] + 1)
+        w.add_sliding_window_pattern([i in mtp["local_layer_ids"] for i in range(n)])
+        w.add_final_logit_softcapping(hp["final_logit_softcapping"])
+        w.add_block_size(mtp["block_size"])
+        w.add_target_layers(mtp["target_layer_ids"])
+        # slot 0 is the anchor, it does not predict a token
+        w.add_sample_from_anchor(False)
+        w.add_has_confidence_head(False)
+        w.add_has_markov_context(True)
+        w.add_file_type(self.ftype)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name in self._folded:
+            suffix = ".bias" if name.endswith(".bias") else ".weight"
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, None, suffix), cast("Tensor", self._folded[name])
+            return
+        if name == "mtp.markov_head.markov_w1.weight":
+            data_torch = data_torch[:self.hparams["unpadded_vocab_size"]]
+        if name in self._ROOT:
+            suffix = ".bias" if name.endswith(".bias") else ".weight"
+            yield self.format_tensor_name(self._ROOT[name], None, suffix), data_torch
+            return
+        if name == "mtp.fuse_weight":
+            if tuple(data_torch.shape) != (self.block_count + 1, len(self.mtp["target_layer_ids"])):
+                raise ValueError(f"Inkling2 DSpark: unexpected fuse_weight shape {tuple(data_torch.shape)}")
+            # one row per draft layer, the last row is for the markov head
+            alpha = torch.softmax(data_torch.float(), dim=-1)
+            for i in range(self.block_count):
+                yield self.format_tensor_name(gguf.MODEL_TENSOR.DFLASH_CTX_MIX, i), alpha[i]
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX), alpha[-1]
+            return
+        if name == "mtp.mask_embed":
+            # copy the one mask embedding to each mask slot
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.DSPARK_MASK_EMBD), data_torch.unsqueeze(0).expand(self.mtp["block_size"] - 1, -1).contiguous()
+            return
+        if name.startswith("mtp."):
+            raise ValueError(f"Inkling2 DSpark: unexpected tensor {name!r}")
+        assert bid is not None
+        key = name.removeprefix(f"model.layers.{bid}.")
+        if key in self._LAYER:
+            yield self.format_tensor_name(self._LAYER[key], bid), data_torch
+            return
+        yield from TextModel.modify_tensors(self, data_torch, name, bid)
+
+
+@ModelBase.register("Inkling2ForConditionalGeneration", "Inkling2LoopForConditionalGeneration")
 class Inkling2VisionModel(MmprojModel):
     def get_vision_config(self):
         config = self.global_config.get("vision_config")
@@ -508,8 +551,3 @@ class Inkling2VisionModel(MmprojModel):
         if name.endswith(("position_embedding", ".lambda_1", ".lambda_2", ".gamma")):
             name = name.removesuffix(".gamma") + ".weight"
         yield from super().modify_tensors(data_torch, name, bid)
-
-
-# the looped variant shares the text and vision converters
-ModelBase.register("Inkling2LoopForConditionalGeneration")(Inkling2Model)
-ModelBase.register("Inkling2LoopForConditionalGeneration")(Inkling2VisionModel)

@@ -326,7 +326,7 @@ static bool parse_bool_value(const std::string & value) {
 // common_models_handler
 //
 
-static std::string get_default_local_path(const std::string & url) {
+std::string common_get_default_local_path(const std::string & url) {
     auto f = string_split<std::string>(url, '#').front();
     f = string_split<std::string>(f, '?').front();
     return fs_get_cache_file(string_split<std::string>(f, '/').back()).string();
@@ -436,7 +436,7 @@ static std::vector<common_download_task> build_url_tasks(const common_params_mod
     if (parts.size() == 1) {
         common_download_task task;
         task.url        = parts[0];
-        task.local_path = model.path.empty() ? get_default_local_path(parts[0]) : model.path;
+        task.local_path = model.path.empty() ? common_get_default_local_path(parts[0]) : model.path;
         task.opts       = opts;
         tasks.push_back(std::move(task));
         return tasks;
@@ -454,7 +454,7 @@ static std::vector<common_download_task> build_url_tasks(const common_params_mod
         task.url  = part;
         task.opts = opts;
 
-        std::string local = get_default_local_path(part);
+        std::string local = common_get_default_local_path(part);
         if (!base_dir.empty()) {
             auto pos = local.rfind('/');
             std::string name = pos == std::string::npos ? local : local.substr(pos + 1);
@@ -487,7 +487,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     auto handle_url = [&](common_params_model & model) {
         if (!model.url.empty()) {
             if (model.path.empty()) {
-                model.path = get_default_local_path(model.url);
+                model.path = common_get_default_local_path(model.url);
             }
         }
     };
@@ -498,7 +498,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     // optionally, if docker repo is set, resolve it
     if (!params.model.docker_repo.empty()) {
         params.model.url  = common_docker_resolve_model(params.model.docker_repo);
-        params.model.path = get_default_local_path(params.model.url);
+        params.model.path = common_get_default_local_path(params.model.url);
     }
 
     // handle plain "url" tasks (non-hf)
@@ -4301,7 +4301,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-sampling"}, "{greedy,probabilistic}",
         string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
-                      "the target verify by rejection sampling; Inkling2 DSpark uses target temperature (1 at target temp 0) (default: %s)",
+                      "the target verify by rejection sampling (default: %s)",
                       params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
         [](common_params & params, const std::string & value) {
             if (value == "greedy") {

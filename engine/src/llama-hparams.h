@@ -275,12 +275,6 @@ struct llama_hparams {
     float    f_qk_clip         = 0.0f;
     float    f_relative_clip   = 0.0f;
 
-    // looped layers: [loop_core_start, loop_core_end) run loop_n_pass times, each visit is its own layer index
-    uint32_t loop_core_start = 0;
-    uint32_t loop_core_end   = 0;
-    uint32_t loop_n_pass     = 0; // < 2: no loop
-    uint32_t loop_gate_rank  = 0; // inkling2
-
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;
@@ -316,12 +310,13 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    uint32_t dspark_context_rank = 0;
     uint32_t dflash_block_size       = 0;
     uint32_t dflash_conv_kernel_size = 0;
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
-    uint32_t dspark_markov_rank      = 0;
+    bool     dspark_f_rnn            = false; // rnn markov head reads f_rnn from embd_state
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;
     uint32_t lilicorr_num_heads      = 0;
@@ -573,14 +568,6 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
-
-    // looped layers: visits beyond the physical layers, physical layer of a visit, first visit of a physical layer
-    uint32_t loop_n_extra() const;
-    uint32_t loop_layer(uint32_t il) const;
-    uint32_t loop_visit(uint32_t ip) const;
-
-    // layers that hold weights (includes nextn layers), the unit of n_gpu_layers; fewer than n_layer_all with looped layers
-    uint32_t n_layer_weights() const;
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

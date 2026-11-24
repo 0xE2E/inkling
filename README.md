@@ -7,9 +7,9 @@ On a laptop RTX 5080 (16 GB), with the same model file and the same drafter as s
 
 | | Stock llama.cpp | inkling | Speedup |
 |---|---:|---:|---:|
-| Decode at 43k context | 26.9 tok/s | **97.4 tok/s** | **3.6x** |
-| Decode at 81k context | 19.0 tok/s | **73.1 tok/s** | **3.8x** |
-| Prefill, 43k-token prompt | 827 tok/s | **2,292 tok/s** | **2.8x** |
+| Decode at 43k context | 26.9 tok/s | **107.2 tok/s** | **4.0x** |
+| Decode at 81k context | 19.0 tok/s | **81.5 tok/s** | **4.3x** |
+| Prefill, 43k-token prompt | 827 tok/s | **2,636 tok/s** | **3.2x** |
 
 Measured at a 128k context window; 90k and 128k run at the same speed at equal fill.
 
@@ -71,24 +71,24 @@ One session, cut at 43k and 81k tokens. The prefill column at 81k is the increme
 |---|---:|---:|---:|---:|
 | Unsloth llama.cpp b12588, Unsloth Studio-style flags¹ | 445 | 313 | 21.1 | 14.3 |
 | Unsloth llama.cpp b12588, tuned flags² | 827 | 759 | 26.9 | 19.0 |
-| **inkling, default profile** | **2,292** | **1,899** | **97.4** | **73.1** |
+| **inkling, default profile** | **2,636** | **2,212** | **107.2** | **81.5** |
 
 ¹ `q8_0` KV cache, `--fit-target 2092`, DSpark with 3 draft tokens.
 ² `--ubatch-size 2048 --fit-target 512 --moe-cache-mib auto`, DSpark with 3 draft tokens.
 
-Against the Studio-style setup, the gain is 5.2x / 6.1x on prefill and 4.6x / 5.1x on decode.
+Against the Studio-style setup, the gain is 5.9x / 7.1x on prefill and 5.1x / 5.7x on decode.
 
 ### Five sessions
 
-Averages over five replayed sessions, generating up to 300 tokens each:
+Averages over five replayed sessions, generating up to 400 tokens each:
 
 | Context | Prefill | Decode, mean | Decode, range |
 |---|---:|---:|---:|
-| ~43k | 2,331 tok/s (cold prompt) | **88.7 tok/s** | 74 – 97 |
-| ~85k | 1,898 tok/s (incremental) | **81.4 tok/s** | 61 – 104 |
+| ~42k | 2,725 tok/s (cold prompt) | **93.2 tok/s** | 82 – 107 |
+| ~83k | 2,230 tok/s (incremental) | **87.4 tok/s** | 76 – 121 |
 
-At long context, speed depends on how often the model accepts the drafter's guesses, not on the length of the context.
-Acceptance ranged from 39% to 100% across these sessions, while one verify round took about 37 ms at 43k and 42 ms at 85k.
+At long context, speed depends on how often the model accepts the drafter's guesses more than on the length of the context.
+The stock-comparison rows above were measured earlier on the b12588 seed and were not re-run.
 
 ### Read with care
 
@@ -115,10 +115,14 @@ the output stays the same and the time drops.
 | Idle VRAM during decode | lend the compute buffer and the unfilled KV cache to the expert cache | ~1.7 GB more cache |
 | Real math was 16% of a prefill batch | a matrix-vector kernel was being fed 2,048 tokens, and sliding-window layers fell to a dense path | fixed both; prefill ~860 → ~1,560 |
 | Expert uploads serialized with prefill compute | upload ahead of the layer on a second stream, into ring slots borrowed from the cache | prefill ~1,560 → ~2,300 |
-| Drafter overhead | trimmed draft chain, token ids from the graph, precomputed head product, draft length that adapts to acceptance | several ms per round |
+| Drafter overhead | trimmed draft chain, token ids from the graph, precomputed head product, draft length that adapts to acceptance; the output head runs once per draft block, not once per drafted position | several ms per round |
+| Sliding-window prefill attention | moved the engine onto Unsloth's llama.cpp b12649, whose banded flash attention handles the sliding-window layers in prefill (it also loads both GGUF layouts) | prefill ~2,300 → ~2,700 |
+| Every host-to-device copy waited ~65 us in the Windows driver before it ran, whatever its size (48 per token) | copies on the compute stream are done by a kernel that reads pinned host memory directly | decode +6.5% with the drafter, +15.6% without |
+| Verify-round attention loaded mask, K and V one after another for each KV tile | turned on the kernel's 2-stage asynchronous load pipeline for these shapes | global-layer attention -25%, decode +2-3% |
 
-A per-kernel accounting of the final profile puts most of the remaining decode time at or near the GPU's memory-bandwidth
-floor. With this drafter, the estimated lossless ceiling for this file on this GPU is about 90-95 tok/s at 43k.
+A map of the final profile against what the math requires (bytes each part must move, at the measured GPU and PCIe rates)
+puts about 15 ms of a ~28.5 ms verify round at 43k at that floor. The rest is spread out: small kernels (~4 ms), host
+work between graph splits (~2.5 ms), short dense matvecs (~2.4 ms above their floor), float matvecs and attention.
 
 ## Correctness
 
@@ -138,12 +142,15 @@ checked, and the ideas that were measured and rejected.
   compute memory to a small expert cache.
 - **Turn warm-up.** For the first ~300 ms after a large prompt, decode runs at about half speed while the cache refills.
 - **Prefill uploads.** Each looped block is still uploaded three times per batch.
+- **Expert misses.** Misses (~5.5 ms per verify round) are still copied before the matvec that needs them. Doing the copy
+  and the matvec in one kernel was bit-exact but slower in the engine, so it is not included.
 
 ## Acknowledgements and licence
 
 - [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) for Inkling-2-Mini.
 - [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) for the GGUF quantizations, the DSpark drafter, and the
-  [llama.cpp build](https://github.com/unslothai/llama.cpp) this engine starts from.
+  [llama.cpp build](https://github.com/unslothai/llama.cpp) this engine starts from (b12649, including its banded flash
+  attention, which the prefill numbers use).
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) and the ggml authors.
 
 MIT licence, see [LICENSE](LICENSE). The `engine/` tree is llama.cpp (MIT) with Unsloth's changes and this project's changes.
