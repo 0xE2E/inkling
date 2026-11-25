@@ -1535,6 +1535,9 @@ public:
         }
 
         common_speculative_impl_draft_dflash::begin(seq_id, prompt);
+        // AMB_DSPARK_ADAPT: the draft length and its acceptance window restart per request. Carried over, they made the
+        // verify batch shape (and through float order, greedy tokens) depend on earlier requests
+        if (adapt_cap != 0) { adapt_n = std::min(adapt_cap, adapt_short()); adapt_rounds = adapt_drafted = adapt_accepted = 0; }
     }
 
     // AMB_DSPARK_ADAPT=1 (default off): draft length follows the running acceptance. Start the server with
@@ -1831,6 +1834,9 @@ public:
         if ((size_t) seq_id < sampler_cfg.size()) {
             sampler_cfg[seq_id].temp = NAN;
         }
+        // AMB_DSPARK_ADAPT: the draft length and its acceptance window restart per request. Carried over, they made the
+        // verify batch shape (and through float order, greedy tokens) depend on earlier requests
+        if (adapt_cap != 0) { adapt_n = std::min(adapt_cap, adapt_short()); adapt_rounds = adapt_drafted = adapt_accepted = 0; }
     }
 
     // AMB_DSPARK_ADAPT=1 (default off): draft length follows the running acceptance. Start the server with
